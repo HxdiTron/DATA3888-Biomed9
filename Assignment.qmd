@@ -4,4 +4,114 @@ format: html
 editor: visual
 ---
 
-## Hello, Initial Commit
+## **Disease: Systemic lupus erythematosus (SLE)**
+
+A chronic autoimmune disease where the immune system attacks healthy tissues, causing inflammation and damage to joints, skin, kidneys, heart, lungs, and the brain. Often triggered by a mix of genetics, environmental factors (e.g., UV light, viruses), and hormones.
+
+## Datasets
+
+-   **GSE88884**: This study characterized baseline gene expression and pharmacodynamic (PD)-induced changes in whole blood gene expression from two phase III, 52-week (W), randomized, placebo-controlled, double-blind studies of 1,760 SLE patients treated with the B cell activating factor (BAFF)-blocking IgG4 monoclonal antibody, tabalumab. Methods: Patient samples were obtained from ILLUMINATE-1 and -2 while control samples were from healthy donors.
+
+    <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE88884>
+
+-   **GSE72509**: RNA-seq of systemic lupus erythematosus (SLE) whole blood and healthy controls to determine the gene expression changes in these patients. <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE72509>
+
+## Research questions
+
+1.  Can whole-blood RNA-seq distinguish SLE patients from healthy controls?
+
+## Innovation
+
+1.  predict with clinical features: combine gene expression with age, sex, ...
+    -   Question can be: Does combining gene expression and clinical features improve prediction compared with gene expression alone?
+
+    -   make the calculator closer to real clinical use
+2.  start with high-dimensional genes; reduce to a 5-20 gene panel; fit LASSO logistic regression or elastic net; build a compact calculator from the selected genes
+
+## EDA
+
+```{r}
+library(GEOquery) 
+library(R.utils)
+library(reshape2)
+library(ggplot2)
+library(limma)
+library(dplyr)
+```
+
+**GSE72509**
+
+it uses RPKM instead of raw counts
+
+-   **117 samples total**: **99 SLE** samples and **18 healthy controls**.
+
+```{r}
+gse <- getGEO("GSE72509")
+gse <- gse[[1]]
+pheno_data <- pData(gse)
+
+getGEOSuppFiles("GSE72509", makeDirectory = TRUE, baseDir = ".")
+
+counts_df <- read.delim(
+  gzfile("GSE72509_SLE_RPKMs.txt.gz"),
+  check.names = FALSE
+)
+
+dim(counts_df)
+head(counts_df)
+
+feature_cols <- c("ALIASES", "CHR", "START", "END", "STR", "COORDS",
+                  "SIZE", "TYPE", "SYMBOL", "DESC", "FEATURE_ID")
+feature_data <- counts_df[, feature_cols]
+
+gene_id <- counts_df[[1]]
+exprMat <- as.matrix(counts_df[, -c(1:11)])
+rownames(exprMat) <- gene_id
+mode(exprMat) <- "numeric"
+
+dim(exprMat)
+exprMat[1:5, 1:5]
+
+gse$Outcome <- ifelse(grepl("SLE", gse$title), "SLE", "Control")
+table(gse$Outcome)
+
+library(preprocessCore)
+log_exprMat <- log2(exprMat + 1)
+summary(log_exprMat[, 1])
+
+ggplot(melt(log_exprMat), aes(x=Var2, y=value)) +  
+  geom_boxplot(outlier.colour="black", outlier.shape=16,outlier.size=0.5, notch=FALSE) +
+  theme(axis.text.x = element_text(angle = 180, hjust = 1)) +
+  labs (x = "Patient", y = "Expression value") +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90))
+
+```
+
+```{r}
+cors <- cor(log_exprMat)
+heatmap(cors)
+```
+
+```{r}
+pca <- prcomp(t(log_exprMat))
+
+df_toplot <- data.frame(gse$Outcome, 
+                        PC1 = pca$x[,1], PC2 = pca$x[,2]  )
+
+ggplot(df_toplot, aes(x = PC1, y = PC2, color = gse.Outcome)) + 
+  geom_point(size = 4) + 
+  theme_minimal()
+```
+
+```{r}
+design <- model.matrix(~gse$Outcome, data = pheno_data)
+fit <- lmFit(log_exprMat, design)
+fit <- eBayes(fit)
+
+library(DT)
+tT <- topTable(fit, genelist=feature_data[,"SYMBOL"], n = Inf)
+tT[1:100, ]
+
+summary(tT$logFC)
+```
