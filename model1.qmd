@@ -1,0 +1,667 @@
+---
+title: "Model 1 - Diagnostic classification of SLE from whole-blood RNA-seq"
+subtitle: "DATA3888 · Biomed9"
+author: "Udit Samant"
+date: today
+bibliography: ref.bib
+link-citations: true
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+    fig-align: center
+    highlight-style: github
+    smooth-scroll: true
+    link-external-newwindow: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+## Background
+
+### Systemic lupus erythematosus
+
+Systemic lupus erythematosus (SLE) is a chronic autoimmune disease in which the immune system attacks healthy tissue, producing inflammation across joints, skin, kidneys, heart, lungs, and brain. Its aetiology is multifactorial, combining genetic predisposition, environmental exposures, and hormonal influence.
+
+### RNA sequencing
+
+RNA sequencing (RNA-seq) is a high-throughput method for measuring the amount of each messenger RNA molecule in a biological sample [@microbenotes_rnaseq]. Total RNA is extracted, fragmented, and converted to DNA. The resulting library is sequenced to produce tens to hundreds of millions of short reads, which are aligned to a reference genome. The number of reads mapping to each gene is taken as a proxy for that gene's expression level. Compared with microarrays, RNA-seq offers a wider dynamic range and is not restricted to a predefined set of probes. In this dataset, gene-level abundance is reported in normalised RPKM units rather than raw read counts.
+
+## Dataset
+
+This analysis uses **GSE72509**, an RNA-seq study of whole blood from SLE patients and healthy controls, deposited on the Gene Expression Omnibus. The accession page is available at <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE72509>.
+
+## Research question
+
+Can whole-blood RNA-seq distinguish SLE patients from healthy controls?
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(GEOquery)
+library(Biobase)
+library(ggplot2)
+library(randomForest)
+library(Boruta)
+library(limma)
+library(glmnet)
+```
+
+## Loading the data
+
+The data for this analysis are obtained from the Gene Expression Omnibus (GEO) accession GSE72509. The series consists of two components: sample-level metadata, distributed as a series matrix file, and gene-level expression values reported as RPKM, distributed as a supplementary file. Both components are retrieved through the `GEOquery` package and cached on disk under `.cache/` so that subsequent renders of this document do not require network access.
+
+Code chunk `cache-init` defines the GEO accession and ensures the cache directory exists.
+
+```{r}
+#| label: cache-init
+gse_id <- "GSE72509"
+cache_dir <- ".cache"
+if (!dir.exists(cache_dir)) {
+  dir.create(cache_dir)
+}
+```
+
+Code chunk `load-geo-metadata` retrieves the series matrix file and parses it into a Bioconductor `ExpressionSet`. On the first invocation the parsed object is serialised to `.cache/GSE72509_geo.rds`; on subsequent invocations the cached object is read directly.
+
+```{r}
+#| label: load-geo-metadata
+#| message: false
+gse_cache_path <- file.path(cache_dir, paste0(gse_id, "_geo.rds"))
+
+if (file.exists(gse_cache_path)) {
+  gse_data <- readRDS(gse_cache_path)
+} else {
+  gse_data <- getGEO(gse_id)[[1]]
+  saveRDS(gse_data, gse_cache_path)
+}
+
+sample_metadata <- pData(gse_data)
+```
+
+Code chunk `load-geo-supplementary` retrieves the supplementary RPKM table via `getGEOSuppFiles()`. The supplementary file is written to `.cache/GSE72509/`; the presence of the file at that path is itself the cache check, and `getGEOSuppFiles()` is invoked only when the file is absent.
+
+```{r}
+#| label: load-geo-supplementary
+#| message: false
+rpkm_filename <- paste0(gse_id, "_SLE_RPKMs.txt.gz")
+rpkm_path <- file.path(cache_dir, gse_id, rpkm_filename)
+
+if (!file.exists(rpkm_path)) {
+  getGEOSuppFiles(gse_id, baseDir = cache_dir, makeDirectory = TRUE)
+}
+```
+
+Code chunk `parse-rpkm` reads the gzipped tab-separated supplementary file into a data frame. The first eleven columns describe gene-level annotation (aliases, chromosome, coordinates, gene length, biotype, symbol, description, internal feature identifier); the remaining columns contain per-sample RPKM values, with column names corresponding to sample identifiers used in the original publication (e.g. `SLE52`, `control3`).
+
+```{r}
+#| label: parse-rpkm
+rpkm_raw <- read.delim(gzfile(rpkm_path), check.names = FALSE)
+```
+
+Code chunk `inspect-loaded` reports the dimensions of the two loaded objects as a sanity check. `sample_metadata` contains one row per GEO sample; `rpkm_raw` contains one row per gene.
+
+```{r}
+#| label: inspect-loaded
+dim(sample_metadata)
+dim(rpkm_raw)
+```
+
+## Exploratory data analysis
+
+### Expression matrix and outcome variable
+
+Code chunk `build-expression-matrix` separates the eleven gene-annotation columns of `rpkm_raw` from the per-sample RPKM values, producing a numeric expression matrix indexed by gene symbol. Where a gene symbol is missing, the internal `FEATURE_ID` is used as a fallback identifier; duplicate symbols are disambiguated with `make.unique()`.
+
+```{r}
+#| label: build-expression-matrix
+annotation_columns <- c("ALIASES", "CHR", "START", "END", "STR", "COORDS",
+                        "SIZE", "TYPE", "SYMBOL", "DESC", "FEATURE_ID")
+
+gene_annotation <- rpkm_raw[, annotation_columns]
+
+rpkm_matrix <- as.matrix(
+  rpkm_raw[, !(colnames(rpkm_raw) %in% annotation_columns)]
+)
+storage.mode(rpkm_matrix) <- "numeric"
+
+gene_symbols <- ifelse(
+  is.na(gene_annotation$SYMBOL) | gene_annotation$SYMBOL == "",
+  paste0("FEATURE_", gene_annotation$FEATURE_ID),
+  gene_annotation$SYMBOL
+)
+rownames(rpkm_matrix) <- make.unique(gene_symbols)
+
+dim(rpkm_matrix)
+```
+
+Code chunk `extract-outcome` derives the diagnostic outcome directly from the column names of `rpkm_matrix`: SLE patients carry the prefix `SLE` and healthy controls the prefix `control`. This approach avoids relying on the GEO series matrix, whose row order does not necessarily align with the supplementary expression file.
+
+```{r}
+#| label: extract-outcome
+sample_outcome <- factor(
+  ifelse(grepl("^control", colnames(rpkm_matrix), ignore.case = TRUE),
+         "Control", "SLE"),
+  levels = c("Control", "SLE")
+)
+
+table(sample_outcome)
+```
+
+The cohort comprises 99 SLE samples and 18 healthy controls, an approximately 5.5:1 imbalance. Mitigation strategies at the modelling stage include stratified train–test splits with class-weighted loss, and minority-class oversampling (for example SMOTE); model performance will be evaluated with balanced accuracy and AUROC rather than raw accuracy.
+
+### Range of RPKM values
+
+RPKM (reads per kilobase of transcript per million mapped reads) is a relative expression unit with no fixed upper bound [@bedre_expression_units]. In whole blood, highly expressed transcripts such as haemoglobin and ribosomal-protein genes routinely exceed 10,000 RPKM, whereas the majority of annotated genes register values close to zero. Code chunk `rpkm-range` summarises the empirical distribution across the full matrix.
+
+```{r}
+#| label: rpkm-range
+summary(as.vector(rpkm_matrix))
+quantile(as.vector(rpkm_matrix),
+         probs = c(0.5, 0.9, 0.99, 0.999, 1))
+```
+
+The strong right-skew (a heavy mass near zero with a long upper tail) motivates a log2 transform with a +1 pseudocount. The transformation compresses the dynamic range and keeps zero values finite. Code chunk `log-transform` applies this transformation.
+
+```{r}
+#| label: log-transform
+log_rpkm_matrix <- log2(rpkm_matrix + 1)
+```
+
+### Distribution of expression values
+
+Code chunk `plot-log-distribution` displays the global distribution of log2-transformed RPKM values across all genes and samples. The mode near zero corresponds to genes that are not appreciably expressed in whole blood; the right tail represents the expressed transcriptome.
+
+```{r}
+#| label: plot-log-distribution
+ggplot(data.frame(log_rpkm = as.vector(log_rpkm_matrix)),
+       aes(x = log_rpkm)) +
+  geom_histogram(bins = 80, fill = "steelblue", colour = "white") +
+  labs(x = expression(log[2](RPKM + 1)),
+       y = "Frequency",
+       title = "Global distribution of log2-transformed RPKM values") +
+  theme_minimal()
+```
+
+Code chunk `plot-sample-boxplots` displays the per-sample distribution of log2-transformed RPKM values as boxplots, with samples ordered and coloured by outcome. Comparable medians and inter-quartile ranges across samples indicate broad distributional consistency between cases and controls; residual sample-level variation will be addressed by between-sample normalisation at the modelling stage.
+
+```{r}
+#| label: plot-sample-boxplots
+#| fig-width: 10
+#| fig-height: 5
+sample_levels <- colnames(log_rpkm_matrix)[
+  order(sample_outcome, colnames(log_rpkm_matrix))
+]
+
+rpkm_long <- data.frame(
+  sample = factor(
+    rep(colnames(log_rpkm_matrix), each = nrow(log_rpkm_matrix)),
+    levels = sample_levels
+  ),
+  log_rpkm = as.vector(log_rpkm_matrix),
+  outcome = rep(sample_outcome, each = nrow(log_rpkm_matrix))
+)
+
+ggplot(rpkm_long, aes(x = sample, y = log_rpkm, fill = outcome)) +
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("Control" = "#66c2a5", "SLE" = "#fc8d62")) +
+  labs(x = "Sample (one boxplot per sample; N = 117; individual labels suppressed for readability)",
+       y = expression(log[2](RPKM + 1)),
+       fill = "Outcome",
+       title = "Per-sample distribution of log2-transformed RPKM values",
+       subtitle = "Each box summarises ~22,000 gene-level expression values within a single sample") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+The per-sample boxplot reveals a striking distributional consistency across the cohort: medians and inter-quartile ranges are nearly identical across all 117 samples. Per-sample medians of log~2~(RPKM + 1) span only 0.42 to 0.60, and per-sample 75th percentiles span only 2.61 to 2.75. This level of inter-sample alignment is not characteristic of raw RPKM, which typically exhibits considerably greater between-sample variability. The observed consistency is most plausibly explained by the application of an additional between-sample normalisation step (such as upper-quartile or quantile normalisation) by the original submitters prior to deposition. As a consequence, downstream analyses can proceed without further global rescaling.
+
+### Highly expressed transcripts
+
+Code chunk `top-expressed-transcripts` reports the ten genes with the highest mean RPKM across the cohort. This serves as a biological sanity check: in whole blood, the most abundant transcripts are expected to derive from blood and immune cells.
+
+```{r}
+#| label: top-expressed-transcripts
+gene_mean_expression <- sort(rowMeans(rpkm_matrix), decreasing = TRUE)
+head(gene_mean_expression, 10)
+```
+
+The ranking is dominated by genes expressed in white blood cells: `S100A9` (a neutrophil marker), `B2M`, `HLA-B`, and `HLA-C` (components of the MHC class I antigen-presentation system [@wiki_mhc_class_i]), and `LYZ` (lysozyme, an antimicrobial enzyme). The presence of `IFITM2`, a gene activated by interferon signalling [@wiki_interferon], is consistent with the known role of interferon activity in SLE biology. Entries with the `LOC100...` prefix correspond to uncharacterised genomic regions whose expression follows that of nearby annotated genes.
+
+## Feature Analysis, Extraction and Initial Modelling
+
+The expression matrix contains approximately 22,000 genes for 117 samples, a high-dimensional regime in which the number of features greatly exceeds the number of observations. Most of these genes are uninformative for distinguishing SLE from healthy controls, and a feature-selection step is required before any classifier is fitted. Three complementary methods are evaluated below: a fast tree-based ranker (random forest with Gini importance), an unsupervised variance decomposition (principal component analysis), and a wrapper-based statistical filter (Boruta).
+
+### Pre-filtering low-expression and low-variance genes
+
+Code chunk `feature-prefilter` discards genes that are expressed at near-baseline levels across the cohort (mean log~2~(RPKM + 1) below 1) and restricts the retained set to the 2,000 genes with the highest variance among those passing the expression threshold. Pre-filtering removes features that contribute only measurement noise and is required for the wrapper-based Boruta procedure to run in tractable time.
+
+```{r}
+#| label: feature-prefilter
+gene_means <- rowMeans(log_rpkm_matrix)
+gene_variances <- apply(log_rpkm_matrix, 1, var)
+
+expressed_indices <- which(gene_means > 1)
+variance_ranking <- order(gene_variances[expressed_indices], decreasing = TRUE)
+selected_indices <- expressed_indices[variance_ranking[1:2000]]
+
+log_rpkm_filtered <- log_rpkm_matrix[selected_indices, ]
+dim(log_rpkm_filtered)
+```
+
+### Random forest with Gini importance
+
+Code chunk `rf-importance` fits a random forest of 500 trees to the pre-filtered matrix and ranks features by mean decrease in Gini impurity. Gini importance is preferred over permutation importance (mean decrease in accuracy) for two reasons. First, it is computed during training at no additional cost, whereas permutation importance requires repeated out-of-bag passes per variable. Second, the well-documented Gini bias toward features with more distinct split values does not apply in this setting: every feature is a continuous log-RPKM value on a comparable scale, so no feature is artificially favoured. Permutation importance remains the more rigorous choice for a final committed selection. The fitted forest is cached to `.cache/rf_fit.rds` to avoid retraining on every render.
+
+```{r}
+#| label: rf-importance
+#| fig-height: 6
+rf_cache_path <- file.path(cache_dir, "rf_fit.rds")
+if (file.exists(rf_cache_path)) {
+  rf_fit <- readRDS(rf_cache_path)
+} else {
+  set.seed(42)
+  rf_fit <- randomForest(
+    x = t(log_rpkm_filtered),
+    y = sample_outcome,
+    ntree = 500,
+    importance = TRUE
+  )
+  saveRDS(rf_fit, rf_cache_path)
+}
+
+rf_gini <- importance(rf_fit, type = 2)
+rf_ranking <- sort(rf_gini[, "MeanDecreaseGini"], decreasing = TRUE)
+
+top_rf <- head(rf_ranking, 20)
+top_rf_df <- data.frame(
+  gene = factor(names(top_rf), levels = rev(names(top_rf))),
+  gini_importance = as.numeric(top_rf)
+)
+
+ggplot(top_rf_df, aes(x = gini_importance, y = gene)) +
+  geom_col(fill = "steelblue") +
+  labs(x = "Mean decrease in Gini impurity",
+       y = "Gene",
+       title = "Top 20 features by random forest Gini importance") +
+  theme_minimal()
+```
+
+The class imbalance in the cohort means that bootstrap samples drawn by the random forest will rarely contain many control samples, and the resulting importance estimates weight the SLE class more heavily. This bias is acceptable for an exploratory ranking but should be revisited at the modelling stage with explicit class-balanced sampling (for example via the `sampsize` argument or the `ranger` implementation with case weights).
+
+### Principal component analysis
+
+Code chunk `pca-fit` performs a scaled principal component analysis on the pre-filtered matrix. Scaling is applied because gene-level variances span several orders of magnitude; without it, a small number of high-variance genes would dominate every component. The variance contributions of the first ten components are reported as a scree plot.
+
+```{r}
+#| label: pca-fit
+pca_fit <- prcomp(t(log_rpkm_filtered), center = TRUE, scale. = TRUE)
+
+variance_explained <- summary(pca_fit)$importance["Proportion of Variance", 1:10]
+scree_df <- data.frame(
+  pc = factor(paste0("PC", 1:10), levels = paste0("PC", 1:10)),
+  variance = as.numeric(variance_explained)
+)
+
+ggplot(scree_df, aes(x = pc, y = variance)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = sprintf("%.1f%%", 100 * variance)),
+            vjust = -0.4, size = 3) +
+  labs(x = "Principal component", y = "Proportion of variance explained",
+       title = "Variance explained by the first ten principal components") +
+  theme_minimal()
+```
+
+Code chunk `pca-scores` projects each sample onto the first two principal components and colours the result by outcome. PCA is unsupervised, so its components capture variance regardless of class membership; whether the dominant axes of variance coincide with the SLE / Control distinction is an empirical question.
+
+```{r}
+#| label: pca-scores
+pc_scores <- data.frame(
+  PC1 = pca_fit$x[, 1],
+  PC2 = pca_fit$x[, 2],
+  outcome = sample_outcome
+)
+
+ggplot(pc_scores, aes(x = PC1, y = PC2, colour = outcome)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  scale_colour_manual(values = c("Control" = "#66c2a5", "SLE" = "#fc8d62")) +
+  labs(title = "Sample scores on the first two principal components",
+       colour = "Outcome") +
+  theme_minimal()
+```
+
+Code chunk `pca-loadings` reports the genes contributing most strongly to PC1 and PC2 by absolute loading. These are the genes that drive the dominant variance structure of the dataset and are natural candidates for inclusion in a downstream classifier.
+
+```{r}
+#| label: pca-loadings
+pc1_loadings <- pca_fit$rotation[, "PC1"]
+pc2_loadings <- pca_fit$rotation[, "PC2"]
+
+top_pc1_genes <- names(sort(abs(pc1_loadings), decreasing = TRUE))[1:15]
+top_pc2_genes <- names(sort(abs(pc2_loadings), decreasing = TRUE))[1:15]
+
+data.frame(
+  pc1_gene    = top_pc1_genes,
+  pc1_loading = round(pc1_loadings[top_pc1_genes], 4),
+  pc2_gene    = top_pc2_genes,
+  pc2_loading = round(pc2_loadings[top_pc2_genes], 4),
+  row.names   = NULL
+)
+```
+
+### Boruta
+
+Boruta augments the feature matrix with a parallel set of "shadow" features obtained by permuting each real feature, then iteratively fits random forests and records, at each iteration, the maximum importance achieved by any shadow feature as a noise-floor threshold. A real feature is registered as a hit when its importance exceeds this threshold; after all iterations a binomial test on the hit count classifies each feature as confirmed, tentative, or rejected. The procedure produces a statistically grounded pass / fail decision rather than a continuous ranking, with a built-in correction for the multiple-testing burden of screening thousands of genes simultaneously.
+
+Code chunk `boruta-fit` runs Boruta with 100 iterations on the pre-filtered matrix. The fitted object is cached to `.cache/boruta_fit.rds` because the run takes several minutes.
+
+```{r}
+#| label: boruta-fit
+boruta_cache_path <- file.path(cache_dir, "boruta_fit.rds")
+if (file.exists(boruta_cache_path)) {
+  boruta_fit <- readRDS(boruta_cache_path)
+} else {
+  set.seed(42)
+  boruta_fit <- Boruta(
+    x = t(log_rpkm_filtered),
+    y = sample_outcome,
+    maxRuns = 100,
+    doTrace = 0
+  )
+  saveRDS(boruta_fit, boruta_cache_path)
+}
+
+table(boruta_fit$finalDecision)
+```
+
+Code chunk `boruta-confirmed` lists the number of features that Boruta classifies as confirmed and reports the first thirty by name.
+
+```{r}
+#| label: boruta-confirmed
+confirmed_features <- getSelectedAttributes(boruta_fit, withTentative = FALSE)
+length(confirmed_features)
+head(confirmed_features, 30)
+```
+
+### TODO
+
+Methods not yet implemented in this report. Each is a candidate for inclusion in subsequent revisions.
+
+-   [ ] **Elastic net.** Combines L1 and L2 penalties. Preferable to pure LASSO when groups of features are highly correlated, as is the case for genes in shared biological pathways.
+-   [ ] **mRMR (minimum redundancy, maximum relevance).** Selects features that are jointly most informative about the outcome while being mutually non-redundant. Produces a more compact panel than methods that ignore inter-feature correlation.
+-   [ ] **Univariate Wilcoxon or t-test filter.** A trivially fast baseline. Useful for sanity-checking that the more sophisticated methods recover similar genes at the top of their respective rankings.
+-   [ ] **Permutation importance for random forest.** A more rigorous alternative to Gini importance for the final committed selection.
+-   [ ] **Class-balanced random forest** (`sampsize` argument or `ranger` with case weights) to mitigate the SLE / Control imbalance during importance estimation.
+
+## Modelling
+
+Three classifiers are fitted and compared on the curated feature panel: a limma-based signature classifier, a random forest, and an L1-penalised logistic regression (LASSO). All three are evaluated by the same stratified 5-fold cross-validation scheme so that performance is directly comparable. Limma is a per-gene regression method, so its regression output (log fold-changes and adjusted p-values) is reported alongside the cross-validated class predictions. Random forest and LASSO are classifiers, so only the cross-validated class predictions are reported.
+
+### Curated feature panel
+
+Inspection of the Boruta-confirmed list and the random-forest top ranking identified three categories of features that are excluded from the modelling panel for reasons unrelated to predictive performance.
+
+-   **`LOC*` entries** (e.g. `LOC100653100`, `LOC100652936`, `LOC100294362`, `LOC400499`) correspond to uncharacterised genomic loci. They lack functional annotation and offer no biological interpretation, so a clinical-style classifier built on them cannot be reasoned about.
+-   **`ND4L`** is encoded by mitochondrial DNA. Its abundance reflects mitochondrial copy number per cell rather than transcriptional regulation, and is sensitive to cell-type composition shifts that are technical rather than disease-related.
+-   **`MIR320E`** is a microRNA. The poly-A-selected library preparation typical of bulk RNA-seq does not capture miRNAs reliably, so any apparent expression signal is unreliable.
+
+Code chunk `curated-panel` applies these removal rules to the Boruta-confirmed list and constructs the curated expression matrix used by the downstream classifiers.
+
+```{r}
+#| label: curated-panel
+boruta_confirmed <- getSelectedAttributes(boruta_fit, withTentative = FALSE)
+
+removal_pattern <- "^(LOC|ND[0-9]|MIR)"
+curated_features <- boruta_confirmed[!grepl(removal_pattern, boruta_confirmed)]
+
+length(boruta_confirmed)
+length(curated_features)
+curated_features
+
+log_rpkm_curated <- log_rpkm_matrix[curated_features, ]
+```
+
+### Cross-validation scheme
+
+Code chunk `cv-folds` constructs a single set of stratified 5-fold assignments. The same fold structure is used for all three models, so any difference in performance reflects model behaviour rather than fold luck.
+
+```{r}
+#| label: cv-folds
+make_stratified_folds <- function(y, k, seed) {
+  set.seed(seed)
+  fold_id <- integer(length(y))
+  for (cls in levels(y)) {
+    cls_idx <- which(y == cls)
+    fold_id[cls_idx] <- sample(rep(seq_len(k), length.out = length(cls_idx)))
+  }
+  fold_id
+}
+
+cv_folds <- make_stratified_folds(sample_outcome, k = 5, seed = 42)
+table(cv_folds, sample_outcome)
+```
+
+### Limma differential expression and class predictions
+
+Code chunk `limma-de` fits a per-gene linear model (`outcome` as the only covariate) on the pre-filtered 2,000-gene matrix with empirical-Bayes shrinkage of variance estimates. The top 20 differentially expressed genes by adjusted p-value are reported as the regression output.
+
+```{r}
+#| label: limma-de
+limma_design <- model.matrix(~ sample_outcome)
+limma_fit <- eBayes(lmFit(log_rpkm_filtered, limma_design))
+
+limma_top <- topTable(limma_fit, coef = 2, number = Inf,
+                      adjust.method = "BH", sort.by = "P")
+head(limma_top, 20)
+```
+
+Code chunk `limma-signature-cv` produces class predictions by a simple signature-score procedure. Within each cross-validation fold, limma is re-fitted on the training samples, and the t-statistics of the top 10 differentially expressed genes are used as signed weights (positive when the gene is up-regulated in SLE, negative when up-regulated in Control). For a held-out sample, the score is the inner product of those weights with the sample's expression across the same ten genes, so larger scores indicate more SLE-like expression. The classification threshold is the prevalence-matched quantile of training-set scores: if 85 per cent of training samples are SLE, the threshold sits at the 15th percentile of training scores so that approximately the same proportion of test samples are predicted SLE. The procedure has no free parameters beyond the choice of top-N and avoids fitting a second statistical model on top of limma.
+
+```{r}
+#| label: limma-signature-cv
+limma_cv_cache <- file.path(cache_dir, "limma_cv.rds")
+if (file.exists(limma_cv_cache)) {
+  limma_cv <- readRDS(limma_cv_cache)
+} else {
+  limma_score <- numeric(length(sample_outcome))
+  limma_class <- factor(rep(NA, length(sample_outcome)),
+                        levels = levels(sample_outcome))
+
+  for (k in seq_len(max(cv_folds))) {
+    test_idx  <- which(cv_folds == k)
+    train_idx <- setdiff(seq_along(cv_folds), test_idx)
+
+    design_train <- model.matrix(~ sample_outcome[train_idx])
+    fit_train <- eBayes(lmFit(log_rpkm_filtered[, train_idx], design_train))
+    top <- topTable(fit_train, coef = 2, number = 10, sort.by = "P")
+    top_genes <- rownames(top)
+    weights   <- top$t
+
+    train_score <- as.numeric(
+      t(log_rpkm_filtered[top_genes, train_idx, drop = FALSE]) %*% weights
+    )
+    test_score <- as.numeric(
+      t(log_rpkm_filtered[top_genes, test_idx,  drop = FALSE]) %*% weights
+    )
+
+    sle_prevalence <- mean(sample_outcome[train_idx] == "SLE")
+    threshold <- as.numeric(
+      quantile(train_score, probs = 1 - sle_prevalence)
+    )
+
+    limma_score[test_idx] <- test_score - threshold
+    limma_class[test_idx] <- factor(
+      ifelse(test_score > threshold, "SLE", "Control"),
+      levels = levels(sample_outcome)
+    )
+  }
+
+  limma_cv <- list(score = limma_score, class = limma_class)
+  saveRDS(limma_cv, limma_cv_cache)
+}
+
+table(true = sample_outcome, predicted = limma_cv$class)
+```
+
+### Random forest classifier
+
+Code chunk `rf-classifier-cv` fits a random forest of 500 trees to the curated feature panel within each cross-validation fold. Both the predicted class and the predicted SLE probability (the proportion of trees voting for SLE) are recorded for each held-out sample.
+
+```{r}
+#| label: rf-classifier-cv
+rf_cv_cache <- file.path(cache_dir, "rf_cv.rds")
+if (file.exists(rf_cv_cache)) {
+  rf_cv <- readRDS(rf_cv_cache)
+} else {
+  rf_class <- factor(rep(NA, length(sample_outcome)),
+                     levels = levels(sample_outcome))
+  rf_prob <- numeric(length(sample_outcome))
+
+  for (k in seq_len(max(cv_folds))) {
+    test_idx  <- which(cv_folds == k)
+    train_idx <- setdiff(seq_along(cv_folds), test_idx)
+
+    set.seed(42 + k)
+    rf_fold <- randomForest(
+      x = t(log_rpkm_curated[, train_idx]),
+      y = sample_outcome[train_idx],
+      ntree = 500
+    )
+    test_x <- t(log_rpkm_curated[, test_idx])
+    rf_class[test_idx] <- predict(rf_fold, newdata = test_x)
+    rf_prob[test_idx]  <- predict(rf_fold, newdata = test_x, type = "prob")[, "SLE"]
+  }
+  rf_cv <- list(class = rf_class, prob = rf_prob)
+  saveRDS(rf_cv, rf_cv_cache)
+}
+
+table(true = sample_outcome, predicted = rf_cv$class)
+```
+
+### LASSO logistic regression
+
+Code chunk `lasso-classifier-cv` fits an L1-penalised logistic regression to the curated feature panel within each outer cross-validation fold. Within each fold an inner cross-validation (`cv.glmnet`) selects the regularisation parameter by minimising binomial deviance; the resulting model is then applied to the held-out outer-fold samples.
+
+```{r}
+#| label: lasso-classifier-cv
+lasso_cv_cache <- file.path(cache_dir, "lasso_cv.rds")
+if (file.exists(lasso_cv_cache)) {
+  lasso_cv <- readRDS(lasso_cv_cache)
+} else {
+  lasso_class <- factor(rep(NA, length(sample_outcome)),
+                        levels = levels(sample_outcome))
+  lasso_prob <- numeric(length(sample_outcome))
+
+  for (k in seq_len(max(cv_folds))) {
+    test_idx  <- which(cv_folds == k)
+    train_idx <- setdiff(seq_along(cv_folds), test_idx)
+
+    set.seed(42 + k)
+    glmnet_fit <- cv.glmnet(
+      x = t(log_rpkm_curated[, train_idx]),
+      y = sample_outcome[train_idx],
+      family = "binomial",
+      alpha = 1,
+      nfolds = 5
+    )
+    test_x <- t(log_rpkm_curated[, test_idx])
+    lasso_class[test_idx] <- factor(
+      predict(glmnet_fit, newx = test_x, s = "lambda.min", type = "class")[, 1],
+      levels = levels(sample_outcome)
+    )
+    lasso_prob[test_idx] <- predict(glmnet_fit, newx = test_x,
+                                    s = "lambda.min", type = "response")[, 1]
+  }
+  lasso_cv <- list(class = lasso_class, prob = lasso_prob)
+  saveRDS(lasso_cv, lasso_cv_cache)
+}
+
+table(true = sample_outcome, predicted = lasso_cv$class)
+```
+
+### Performance summary
+
+Code chunk `performance-summary` reports the standard metrics for binary classification on imbalanced data: overall accuracy, balanced accuracy, per-class F1, macro-averaged F1, the Matthews correlation coefficient (MCC), and AUROC computed from the model's continuous output. An uninformative classifier that always predicts SLE would achieve 84.6 per cent raw accuracy, 0.5 balanced accuracy, an SLE F1 of 0.92 but a Control F1 of 0, an MCC of 0, and an AUROC of 0.5; reporting the full set of metrics avoids being misled by the high prevalence.
+
+```{r}
+#| label: performance-summary
+score_predictions <- function(true_labels, predicted_class,
+                              score = NULL, positive = "SLE") {
+  cm <- table(true = true_labels, predicted = predicted_class)
+
+  tp <- cm[positive, positive]
+  fn <- sum(cm[positive, ]) - tp
+  fp <- sum(cm[, positive]) - tp
+  tn <- sum(cm) - tp - fn - fp
+
+  recall_sle  <- tp / (tp + fn)
+  recall_ctrl <- tn / (tn + fp)
+  precision_sle  <- if ((tp + fp) > 0) tp / (tp + fp) else NA_real_
+  precision_ctrl <- if ((tn + fn) > 0) tn / (tn + fn) else NA_real_
+
+  f1 <- function(prec, rec) {
+    if (is.na(prec) || is.na(rec) || (prec + rec) == 0) NA_real_
+    else 2 * prec * rec / (prec + rec)
+  }
+
+  f1_sle  <- f1(precision_sle,  recall_sle)
+  f1_ctrl <- f1(precision_ctrl, recall_ctrl)
+
+  mcc_denom <- sqrt(as.numeric(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+  mcc <- if (mcc_denom == 0) 0 else (tp * tn - fp * fn) / mcc_denom
+
+  out <- c(
+    accuracy          = (tp + tn) / sum(cm),
+    balanced_accuracy = (recall_sle + recall_ctrl) / 2,
+    f1_sle            = f1_sle,
+    f1_control        = f1_ctrl,
+    macro_f1          = mean(c(f1_sle, f1_ctrl), na.rm = TRUE),
+    mcc               = mcc
+  )
+
+  if (!is.null(score)) {
+    pos <- score[true_labels == positive]
+    neg <- score[true_labels != positive]
+    auroc <- (sum(outer(pos, neg, ">")) + 0.5 * sum(outer(pos, neg, "=="))) /
+             (length(pos) * length(neg))
+    out <- c(out, auroc = auroc)
+  }
+  out
+}
+
+performance_table <- rbind(
+  Limma           = score_predictions(sample_outcome, limma_cv$class, limma_cv$score),
+  `Random forest` = score_predictions(sample_outcome, rf_cv$class,    rf_cv$prob),
+  LASSO           = score_predictions(sample_outcome, lasso_cv$class, lasso_cv$prob)
+)
+
+round(performance_table, 3)
+```
+
+## Related and further reading
+
+This section collects supplementary methodological context that is relevant to the analytical decisions made in this report. It will be extended as subsequent stages of the analysis introduce new techniques.
+
+### Cross-sample comparability of RPKM
+
+RPKM is convenient within a single sample but is unreliable for direct cross-sample comparison, because its per-million denominator depends on each sample's own transcriptome composition [@bedre_expression_units]. A sample dominated by a small number of highly expressed transcripts will have all other genes deflated relative to a sample with a more uniform expression profile, and the sum of RPKM across genes is not constant between samples. **Transcripts per million (TPM)** addresses this by constraining the per-sample total to one million, so that identical biological abundances yield identical values regardless of the surrounding transcriptome. The supplementary file used here is provided in RPKM and appears to have been further normalised between samples prior to deposition; recomputation in TPM would require returning to raw read counts in the SRA, which is outside the scope of this report.
+
+## References
+
+::: {#refs}
+:::
