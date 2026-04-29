@@ -1,0 +1,1041 @@
+---
+title: "hako"
+format: html
+editor: visual
+---
+
+```{r}
+library(GEOquery)
+
+gse <- getGEO("GSE49454", GSEMatrix = TRUE)
+
+expr <- exprs(gse[[1]])
+meta <- pData(gse[[1]])
+
+```
+
+```{r}
+dim(expr)
+```
+
+```{r}
+grep("SLEDAI|sledai|activity", colnames(meta), value = TRUE)
+grep("patient|subject|id", colnames(meta), value = TRUE)
+grep("visit|time|week", colnames(meta), value = TRUE)
+
+
+head(meta$title)
+
+head(meta$characteristics_ch1)
+```
+
+```{r}
+meta$sample_name <- meta$title
+
+# Extract patient ID
+meta$patient_id <- sub("V[0-9]+$", "", meta$sample_name)
+
+# Extract visit number
+meta$visit <- as.numeric(sub(".*V", "", meta$sample_name))
+
+head(meta[, c("sample_name", "patient_id", "visit")])
+
+View(expr[1:500, 1:20])
+```
+
+```{r}
+library(ggplot2)
+
+meta$sledai <- as.numeric(meta$`sledai:ch1`)
+
+# sort properly
+meta <- meta[order(meta$patient_id, meta$visit), ]
+
+# pick a few patients
+ids <- names(sort(table(meta$patient_id), decreasing=TRUE))[1:20]
+
+plot_data <- meta[meta$patient_id %in% ids, ]
+
+ggplot(plot_data, aes(x = visit, y = sledai, group = patient_id, color = patient_id)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = "SLE Disease Activity Over Time (Example Patients)",
+       x = "Visit",
+       y = "SLEDAI Score")
+```
+
+```{r}
+length(unique(meta$patient_id))
+visit_counts <- table(meta$patient_id)
+summary(visit_counts)
+table(visit_counts)
+```
+
+```{r}
+meta$sledai <- as.numeric(meta$`sledai:ch1`)
+
+meta$activity_class <- cut(
+  meta$sledai,
+  breaks = c(-Inf, 6, 12, Inf),
+  labels = c("Inactive", "Moderate", "Active")
+)
+
+table(meta$activity_class)
+```
+
+```{r}
+## -----------------------------
+# 1. CLEAN & CREATE TARGET
+# -----------------------------
+# Ensure the lead/future variable exists
+meta <- meta[order(meta$patient_id, meta$visit), ]
+meta$future_sledai <- ave(meta$sledai, meta$patient_id, FUN = function(x) c(x[-1], NA))
+
+# Define binary cut: 0-6 Inactive, 6+ Active
+meta$future_binary <- cut(
+  meta$future_sledai,
+  breaks = c(-Inf, 6, Inf),
+  labels = c("Inactive", "Active")
+)
+
+# Drop NAs (patients with no future visit)
+meta <- meta[!is.na(meta$future_binary), ]
+meta$future_binary <- droplevels(meta$future_binary)
+
+# -----------------------------
+# 2. BETTER FEATURE SELECTION
+# -----------------------------
+# Instead of first 300 genes, take the 300 most variable genes
+gene_vars <- apply(expr, 1, var)
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:300]
+
+expr_df <- as.data.frame(t(expr[top_genes, ]))
+colnames(expr_df) <- make.names(colnames(expr_df))
+expr_df$geo_accession <- rownames(expr_df)
+
+# Merge
+data_bin <- merge(meta, expr_df, by = "geo_accession")
+
+X <- data_bin[, make.names(top_genes)]
+y <- data_bin$future_binary
+
+# -----------------------------
+# 3. STRATIFIED SPLIT
+# -----------------------------
+library(caret)
+set.seed(123)
+train_idx <- createDataPartition(y, p = 0.7, list = FALSE)
+
+X_train <- X[train_idx, ]
+y_train <- y[train_idx]
+X_test <- X[-train_idx, ]
+y_test <- y[-train_idx]
+
+# -----------------------------
+# 4. TRAIN WITH DOWNSAMPLING
+# -----------------------------
+library(randomForest)
+
+# Calculate smallest class size for balancing
+n_min <- min(table(y_train))
+
+model_bin <- randomForest(
+  x = X_train, 
+  y = as.factor(y_train), 
+  ntree = 1000,
+  sampsize = c(n_min, n_min), # This fixes the 'always predict Active' bug
+  importance = TRUE
+)
+
+# -----------------------------
+# 5. EVALUATE
+# -----------------------------
+preds_bin <- predict(model_bin, X_test)
+print("Binary Confusion Matrix (Balanced):")
+print(table(Predicted = preds_bin, Actual = y_test))
+
+accuracy <- mean(preds_bin == y_test)
+cat("\nBalanced Accuracy:", round(accuracy, 4), "\n")
+
+# Check which genes actually mattered
+varImpPlot(model_bin, n.var = 10, main = "Top 10 Predictive Genes")
+```
+
+```{r}
+
+# 1. Get the metadata
+metadata <- pData(gse[[1]])
+
+# 2. Identify columns with time-related keywords
+# This looks for "time", "month", "day", "visit", etc.
+time_keywords <- "time|month|day|duration|visit|year|week"
+target_cols <- grep(time_keywords, colnames(metadata), ignore.case = TRUE, value = TRUE)
+
+# 3. Print the column names found and the first few rows
+print("Time-related columns found:")
+print(target_cols)
+
+# 4. Show the data
+if(length(target_cols) > 0) {
+    head(metadata[, target_cols])
+} else {
+    print("No explicit time columns found beyond the 'Visit' titles.")
+}
+```
+
+# Treatment Response
+
+```{r}
+gse <- getGEO("GSE224705", GSEMatrix = TRUE)
+meta <- pData(gse[[1]])
+
+colnames(meta)
+
+
+
+```
+
+```{r}
+head(meta$`str4_response:ch1`, 20)
+summary(meta$`str4_response:ch1`)
+unique(meta$`str4_response:ch1`)
+
+grep("response|responder|sri|drug|aza|mmf|soc|hc", colnames(meta), value = TRUE, ignore.case = TRUE)
+
+head(meta[, grep("characteristics_ch1", colnames(meta), value = TRUE)], 10)
+```
+
+```{r}
+table(meta$`diagnosis:ch1`)
+```
+
+```{r}
+meta_sle <- meta[meta$`diagnosis:ch1` == "SLE", ]
+```
+
+```{r}
+
+table(meta_sle$`sri4_response:ch1`)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(meta_sle, aes(x = response)) +
+  geom_bar(fill = "#2C7BB6") +
+  labs(title = "Treatment Response Distribution",
+       x = "Response",
+       y = "Count")
+```
+
+```{r}
+ggplot(meta_sle, aes(x = `drug_group:ch1`, fill = response)) +
+  geom_bar(position = "fill") +
+  labs(title = "Response Rate by Treatment",
+       x = "Treatment",
+       y = "Proportion") +
+  scale_fill_manual(values = c("lightblue", "pink"))
+```
+
+```{r}
+library(randomForest)
+
+# -----------------------------
+# 1. CLEAN RESPONSE
+# -----------------------------
+meta_sle$response <- ifelse(
+  meta_sle$`sri4_response:ch1` == "YES",
+  "Responder",
+  "Non-responder"
+)
+meta_sle$response <- as.factor(meta_sle$response)
+
+# -----------------------------
+# 2. PREP EXPRESSION
+# -----------------------------
+# Transpose expression: Rows = Samples, Cols = Genes
+expr_df <- as.data.frame(t(expr))
+# Ensure the gene names are R-safe immediately
+colnames(expr_df) <- make.names(colnames(expr_df))
+# Create the merge key
+expr_df$geo_accession <- rownames(expr_df)
+
+# Merge
+# IMPORTANT: Check if 'geo_accession' exists in meta_sle. 
+# If it's the rownames of meta_sle instead of a column, we fix that here:
+if(!"geo_accession" %in% colnames(meta_sle)) {
+    meta_sle$geo_accession <- rownames(meta_sle)
+}
+
+data_combined <- merge(meta_sle, expr_df, by = "geo_accession")
+
+# -----------------------------
+# 3. ISOLATE GENE COLUMNS (The "Safe" Way)
+# -----------------------------
+# Instead of setdiff, let's just grab the columns we know came from expr_df
+# which are now in data_combined
+all_gene_names <- colnames(expr_df)[colnames(expr_df) != "geo_accession"]
+
+# Verify we actually have data
+if(length(all_gene_names) == 0) stop("No gene columns found after merge!")
+
+# -----------------------------
+# 4. FEATURE SELECTION
+# -----------------------------
+# Convert gene columns to numeric matrix for speed/reliability
+gene_matrix <- as.matrix(data_combined[, all_gene_names])
+storage.mode(gene_matrix) <- "numeric"
+
+# Calculate variance, ignoring NAs
+vars <- apply(gene_matrix, 2, var, na.rm = TRUE)
+vars <- vars[is.finite(vars)]
+
+top_n <- min(200, length(vars))
+top_genes <- names(sort(vars, decreasing = TRUE))[1:top_n]
+
+# Final Model Inputs
+X <- as.data.frame(gene_matrix[, top_genes])
+y <- data_combined$response
+
+cat("Final Data Shape:", dim(X), "\n")
+print(table(y))
+
+# -----------------------------
+# 5. TRAIN / TEST SPLIT & MODEL
+# -----------------------------
+set.seed(1)
+train_idx <- sample(seq_len(nrow(X)), size = round(0.7 * nrow(X)))
+
+model <- randomForest(
+  x = X[train_idx, ], 
+  y = y[train_idx], 
+  xtest = X[-train_idx, ], 
+  ytest = y[-train_idx],
+  ntree = 500,
+  importance = TRUE
+)
+
+# -----------------------------
+# 6. EVALUATE
+# -----------------------------
+print(model$test$confusion)
+varImpPlot(model, n.var = 10, main = "Top 10 Predictive Genes")
+varImpPlot(model, n.var = 10, main = "Top 10 Predictive Genes")
+```
+
+```{r}
+# 1. Ensure you have the CORRECT GSE loaded
+gse_new <- getGEO("GSE224705", GSEMatrix = TRUE)
+meta_sle <- pData(gse_new[[1]])
+expr_new <- exprs(gse_new[[1]]) # This is the missing piece!
+
+# 2. Filter for SLE patients only (as you did before)
+meta_sle <- meta_sle[meta_sle$`diagnosis:ch1` == "SLE", ]
+
+# 3. Define the response variable
+meta_sle$response <- as.factor(ifelse(
+  meta_sle$`sri4_response:ch1` == "YES", "Responder", "Non-responder"
+))
+
+# 4. ALIGNMENT
+common_ids <- intersect(meta_sle$geo_accession, colnames(expr_new))
+
+if(length(common_ids) == 0) {
+  stop("IDs still don't match. Check if gse_new loaded correctly.")
+}
+
+final_expr <- expr_new[, common_ids]
+final_meta <- meta_sle[match(common_ids, meta_sle$geo_accession), ]
+
+cat("Success! Aligned", ncol(final_expr), "samples from the correct dataset.")
+```
+
+```{r}
+library(randomForest)
+library(caret)
+library(pROC)
+
+set.seed(42)
+
+# -----------------------------
+# 1. STRATIFIED TRAIN/TEST SPLIT
+# -----------------------------
+train_idx <- createDataPartition(final_meta$response, p = 0.7, list = FALSE)
+
+meta_train <- final_meta[train_idx, ]
+meta_test  <- final_meta[-train_idx, ]
+
+expr_train <- final_expr[, rownames(meta_train)]
+expr_test  <- final_expr[, rownames(meta_test)]
+
+# -----------------------------
+# 2. FEATURE SELECTION ON TRAIN ONLY
+# -----------------------------
+gene_vars <- apply(expr_train, 1, var, na.rm = TRUE)
+
+# try fewer genes first
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:20]
+
+X_train <- as.data.frame(t(expr_train[top_genes, ]))
+X_test  <- as.data.frame(t(expr_test[top_genes, ]))
+
+colnames(X_train) <- make.names(colnames(X_train))
+colnames(X_test)  <- make.names(colnames(X_test))
+
+y_train <- factor(meta_train$response)
+y_test  <- factor(meta_test$response)
+
+# make sure class order is consistent
+y_train <- factor(y_train, levels = c("Non-responder", "Responder"))
+y_test  <- factor(y_test, levels = c("Non-responder", "Responder"))
+
+# -----------------------------
+# 3. HANDLE CLASS IMBALANCE
+# -----------------------------
+class_counts <- table(y_train)
+minority_n <- min(class_counts)
+
+rf_model <- randomForest(
+  x = X_train,
+  y = y_train,
+  ntree = 1000,
+  mtry = floor(sqrt(ncol(X_train))),
+  importance = TRUE,
+  sampsize = c(minority_n, minority_n)   # balanced sampling per tree
+)
+
+# -----------------------------
+# 4. PREDICTIONS
+# -----------------------------
+pred_class <- predict(rf_model, X_test, type = "response")
+pred_prob  <- predict(rf_model, X_test, type = "prob")[, "Responder"]
+
+cm <- confusionMatrix(pred_class, y_test, positive = "Responder")
+print(cm)
+
+roc_obj <- roc(response = y_test, predictor = pred_prob, levels = rev(levels(y_test)))
+cat("AUC:", auc(roc_obj), "\n")
+```
+
+```{r}
+library(caret)
+library(glmnet)
+library(pROC)
+
+set.seed(42)
+
+# -----------------------------
+# 1. TRAIN / TEST SPLIT
+# -----------------------------
+train_idx <- createDataPartition(final_meta$response, p = 0.7, list = FALSE)
+
+meta_train <- final_meta[train_idx, ]
+meta_test  <- final_meta[-train_idx, ]
+
+expr_train <- final_expr[, rownames(meta_train)]
+expr_test  <- final_expr[, rownames(meta_test)]
+
+# -----------------------------
+# 2. FEATURE SELECTION (TRAIN ONLY)
+# -----------------------------
+gene_vars <- apply(expr_train, 1, var, na.rm = TRUE)
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:20]
+
+X_train <- as.data.frame(t(expr_train[top_genes, ]))
+X_test  <- as.data.frame(t(expr_test[top_genes, ]))
+
+colnames(X_train) <- make.names(colnames(X_train))
+colnames(X_test)  <- make.names(colnames(X_test))
+
+# -----------------------------
+# 3. CLEAN CLASS NAMES
+# -----------------------------
+y_train <- factor(meta_train$response, levels = c("Non-responder", "Responder"))
+y_test  <- factor(meta_test$response, levels = c("Non-responder", "Responder"))
+
+levels(y_train) <- c("NonResponder", "Responder")
+levels(y_test)  <- c("NonResponder", "Responder")
+
+train_df <- X_train
+train_df$response <- y_train
+
+# -----------------------------
+# 4. TRAIN CONTROL (SMOTE + CV)
+# -----------------------------
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "smote"
+)
+
+# -----------------------------
+# 5. TRAIN LASSO MODEL
+# -----------------------------
+lasso_fit <- train(
+  response ~ .,
+  data = train_df,
+  method = "glmnet",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneGrid = expand.grid(
+    alpha = 1,  # LASSO
+    lambda = seq(0.001, 0.1, length = 20)
+  )
+)
+
+print(lasso_fit)
+
+# -----------------------------
+# 6. PREDICTIONS
+# -----------------------------
+pred_prob <- predict(lasso_fit, X_test, type = "prob")[, "NonResponder"]
+
+# threshold tuned for your goal
+threshold <- 0.4
+
+pred_class <- ifelse(pred_prob > threshold, "NonResponder", "Responder")
+pred_class <- factor(pred_class, levels = c("NonResponder", "Responder"))
+
+cm <- confusionMatrix(pred_class, y_test, positive = "NonResponder")
+print(cm)
+
+roc_obj <- roc(response = y_test,
+               predictor = pred_prob,
+               levels = c("Responder", "NonResponder"))
+
+cat("AUC:", auc(roc_obj), "\n")
+```
+
+```{r}
+library(caret)
+library(e1071)
+
+set.seed(42)
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "smote"
+)
+
+svm_fit <- train(
+  response ~ .,
+  data = train_df,
+  method = "svmRadial",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneLength = 5
+)
+
+print(svm_fit)
+
+pred_prob <- predict(svm_fit, X_test, type = "prob")[, "NonResponder"]
+
+threshold <- 0.6
+pred_class <- ifelse(pred_prob > threshold, "NonResponder", "Responder")
+pred_class <- factor(pred_class, levels = c("NonResponder", "Responder"))
+
+confusionMatrix(pred_class, y_test, positive = "NonResponder")
+```
+
+# Model 2 Replacement
+
+```{r}
+library(GEOquery)
+
+gse <- getGEO("GSE65391", GSEMatrix = TRUE)
+
+expr <- exprs(gse[[1]])
+meta <- pData(gse[[1]])
+```
+
+```{r}
+dim(expr)
+dim(meta)
+
+colnames(meta)
+```
+
+```{r}
+meta$patient <- meta$`subject:ch1`
+meta$visit   <- as.numeric(meta$`visit:ch1`)
+meta$sledai  <- as.numeric(meta$`sledai:ch1`)
+
+
+meta$activity <- ifelse(meta$sledai >=4 "Active", "Inactive")
+meta$activity <- factor(meta$activity, levels = c("Inactive", "Active"))
+
+expr_df <- as.data.frame(t(expr))
+expr_df$geo_accession <- rownames(expr_df)
+
+meta$geo_accession <- rownames(meta)
+
+data <- merge(meta, expr_df, by = "geo_accession")
+
+
+data <- data[order(data$patient, data$visit), ]
+
+
+library(dplyr)
+
+data <- data %>%
+  group_by(patient) %>%
+  mutate(next_activity = lead(activity)) %>%
+  ungroup()
+
+data <- data[!is.na(data$next_activity), ]
+
+library(ggplot2)
+
+ggplot(meta, aes(x = sledai)) +
+  geom_histogram(binwidth = 2) +
+  labs(title = "Distribution of SLE Disease Activity (SLEDAI)",
+       x = "SLEDAI Score",
+       y = "Count") +
+  theme_minimal()
+
+
+ggplot(meta, aes(x = activity)) +
+  geom_bar() +
+  labs(title = "Class Distribution: Active vs Inactive SLE",
+       x = "Disease State",
+       y = "Count") +
+  theme_minimal()
+
+
+library(dplyr)
+
+# sample a few patients for clarity
+set.seed(1)
+sample_patients <- sample(unique(meta$patient), 10)
+
+plot_data <- meta %>% filter(patient %in% sample_patients)
+
+ggplot(plot_data, aes(x = visit, y = sledai, group = patient, color = patient)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Longitudinal SLE Disease Activity (Sample Patients)",
+       x = "Visit",
+       y = "SLEDAI Score") http://127.0.0.1:31915/chunk_output/F3B02D3114f6648d/A139F37A/cntm870y8sq3e/000016.png+
+  theme_minimal()
+```
+
+```{r}
+meta_clean <- meta[!is.na(meta$activity), ]
+
+ggplot(meta_clean, aes(x = activity)) +
+  geom_bar() +
+  labs(title = "Class Distribution: Active vs Inactive SLE")
+```
+
+```{r}
+library(GEOquery)
+library(dplyr)
+library(caret)
+library(pROC)
+library(e1071)
+
+# -----------------------------
+# 1. LOAD DATA
+# -----------------------------
+gse <- getGEO("GSE65391", GSEMatrix = TRUE)
+
+expr <- exprs(gse[[1]])
+meta <- pData(gse[[1]])
+
+# -----------------------------
+# 2. CLEAN OUTCOME + IDS
+# -----------------------------
+meta$sledai <- suppressWarnings(as.numeric(meta$`sledai:ch1`))
+meta$activity <- ifelse(meta$sledai >= 4, "Active", "Inactive")
+meta$activity <- factor(meta$activity, levels = c("Inactive", "Active"))
+
+meta$geo_accession <- rownames(meta)
+
+# expression: samples x genes
+expr_df <- as.data.frame(t(expr))
+expr_df$geo_accession <- rownames(expr_df)
+
+# merge metadata + expression
+data <- merge(meta, expr_df, by = "geo_accession")
+
+# -----------------------------
+# 3. LONGITUDINAL SETUP
+# -----------------------------
+data <- data %>%
+  mutate(
+    patient   = `subject:ch1`,
+    visit_raw = `visit:ch1`,
+    visit     = suppressWarnings(as.numeric(`visit:ch1`))
+  ) %>%
+  filter(!is.na(patient), !is.na(visit), !is.na(sledai), !is.na(activity)) %>%
+  arrange(patient, visit) %>%
+  group_by(patient) %>%
+  mutate(next_activity = lead(activity)) %>%
+  ungroup() %>%
+  filter(!is.na(next_activity))
+
+# quick check
+print(table(data$next_activity))
+
+# -----------------------------
+# 4. TRAIN / TEST SPLIT
+# -----------------------------
+set.seed(42)
+train_idx <- createDataPartition(data$next_activity, p = 0.7, list = FALSE)
+
+train_data <- data[train_idx, ]
+test_data  <- data[-train_idx, ]
+
+# -----------------------------
+# 5. FEATURE SELECTION ON TRAIN ONLY
+# -----------------------------
+# only true gene-expression columns
+gene_cols <- setdiff(colnames(expr_df), "geo_accession")
+
+X_train_full <- train_data[, gene_cols]
+X_test_full  <- test_data[, gene_cols]
+
+# force numeric
+X_train_full <- data.frame(lapply(X_train_full, function(x) as.numeric(as.character(x))))
+X_test_full  <- data.frame(lapply(X_test_full, function(x) as.numeric(as.character(x))))
+
+# remove columns that are all NA or zero variance in TRAIN
+keep <- sapply(X_train_full, function(x) !all(is.na(x)) && var(x, na.rm = TRUE) > 0)
+X_train_full <- X_train_full[, keep]
+X_test_full  <- X_test_full[, keep]
+
+# top 20 most variable genes from TRAIN only
+gene_vars <- sapply(X_train_full, var, na.rm = TRUE)
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:20]
+
+X_train <- X_train_full[, top_genes]
+X_test  <- X_test_full[, top_genes]
+
+y_train <- factor(train_data$next_activity, levels = c("Inactive", "Active"))
+y_test  <- factor(test_data$next_activity, levels = c("Inactive", "Active"))
+
+colnames(X_train) <- make.names(colnames(X_train))
+colnames(X_test)  <- make.names(colnames(X_test))
+
+# optional checks
+print(dim(X_train))
+print(sum(is.na(X_train)))
+print(table(y_train))
+
+# -----------------------------
+# 6. TRAIN SVM
+# -----------------------------
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "smote"
+)
+
+set.seed(42)
+svm_fit <- train(
+  x = X_train,
+  y = y_train,
+  method = "svmRadial",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneLength = 5
+)
+
+print(svm_fit)
+
+# -----------------------------
+# 7. EVALUATE
+# -----------------------------
+pred_prob <- predict(svm_fit, X_test, type = "prob")[, "Active"]
+
+threshold <- 0.5
+pred_class <- ifelse(pred_prob > threshold, "Active", "Inactive")
+pred_class <- factor(pred_class, levels = c("Inactive", "Active"))
+
+cm <- confusionMatrix(pred_class, y_test, positive = "Active")
+print(cm)
+
+roc_obj <- roc(y_test, pred_prob, levels = c("Inactive", "Active"))
+cat("AUC:", auc(roc_obj), "\n")
+
+```
+
+```{r}
+gse_49454 <- getGEO("GSE49454", GSEMatrix = TRUE)
+
+expr_49454 <- exprs(gse_49454[[1]])
+meta_49454 <- pData(gse_49454[[1]])
+
+
+gse_65391 <- getGEO("GSE65391", GSEMatrix = TRUE)
+
+expr_65391 <- exprs(gse_65391[[1]])
+meta_65391 <- pData(gse_65391[[1]])
+
+
+genes_49454 <- rownames(expr_49454)
+genes_65391 <- rownames(expr_65391)
+
+common_genes <- intersect(genes_49454, genes_65391)
+
+length(common_genes)
+```
+
+```{r}
+expr_49454 <- expr_49454[common_genes, ]
+expr_65391 <- expr_65391[common_genes, ]
+```
+
+```{r}
+library(GEOquery)
+
+# -----------------------------
+# 1. LOAD BOTH DATASETS
+# -----------------------------
+gse_49454 <- getGEO("GSE49454", GSEMatrix = TRUE)
+expr_49454 <- exprs(gse_49454[[1]])
+meta_49454 <- pData(gse_49454[[1]])
+
+gse_65391 <- getGEO("GSE65391", GSEMatrix = TRUE)
+expr_65391 <- exprs(gse_65391[[1]])
+meta_65391 <- pData(gse_65391[[1]])
+
+# -----------------------------
+# 2. FIND COMMON GENES
+# -----------------------------
+common_genes <- intersect(rownames(expr_49454), rownames(expr_65391))
+length(common_genes)
+
+expr_49454 <- expr_49454[common_genes, ]
+expr_65391 <- expr_65391[common_genes, ]
+
+# -----------------------------
+# 3. CREATE CONSISTENT LABELS
+# -----------------------------
+# GSE49454
+meta_49454$sledai <- suppressWarnings(as.numeric(meta_49454$`sledai:ch1`))
+meta_49454$activity <- ifelse(meta_49454$sledai >= 4, "Active", "Inactive")
+
+# GSE65391
+meta_65391$sledai <- suppressWarnings(as.numeric(meta_65391$`sledai:ch1`))
+meta_65391$activity <- ifelse(meta_65391$sledai >= 4, "Active", "Inactive")
+
+# remove missing
+meta_49454 <- meta_49454[!is.na(meta_49454$activity), ]
+meta_65391 <- meta_65391[!is.na(meta_65391$activity), ]
+
+# -----------------------------
+# 4. ALIGN EXPRESSION WITH META
+# -----------------------------
+expr_49454_df <- as.data.frame(t(expr_49454))
+expr_49454_df$geo_accession <- rownames(expr_49454_df)
+
+expr_65391_df <- as.data.frame(t(expr_65391))
+expr_65391_df$geo_accession <- rownames(expr_65391_df)
+
+meta_49454$geo_accession <- rownames(meta_49454)
+meta_65391$geo_accession <- rownames(meta_65391)
+
+data_49454 <- merge(meta_49454[, c("geo_accession", "activity")],
+                    expr_49454_df, by = "geo_accession")
+
+data_65391 <- merge(meta_65391[, c("geo_accession", "activity")],
+                    expr_65391_df, by = "geo_accession")
+
+# -----------------------------
+# 5. COMBINE DATASETS
+# -----------------------------
+data_combined <- rbind(data_49454, data_65391)
+
+# -----------------------------
+# 6. PRINT CLASS BALANCE
+# -----------------------------
+table(data_combined$activity)
+prop.table(table(data_combined$activity))
+```
+
+```{r}
+library(randomForest)
+library(caret)
+library(pROC)
+
+set.seed(42)
+
+# -----------------------------
+# 1. PREP DATA
+# -----------------------------
+data_combined$activity <- factor(data_combined$activity,
+                                 levels = c("Inactive", "Active"))
+
+# split
+train_idx <- createDataPartition(data_combined$activity, p = 0.7, list = FALSE)
+
+train_data <- data_combined[train_idx, ]
+test_data  <- data_combined[-train_idx, ]
+
+# -----------------------------
+# 2. FEATURE SELECTION (TRAIN ONLY)
+# -----------------------------
+gene_cols <- setdiff(colnames(train_data), c("geo_accession", "activity", "dataset"))
+
+# ensure numeric
+train_data[, gene_cols] <- lapply(train_data[, gene_cols], function(x) as.numeric(as.character(x)))
+test_data[, gene_cols]  <- lapply(test_data[, gene_cols], function(x) as.numeric(as.character(x)))
+
+# remove bad columns
+keep <- sapply(train_data[, gene_cols], function(x) !all(is.na(x)) && var(x, na.rm = TRUE) > 0)
+
+gene_cols <- gene_cols[keep]
+
+# select top 20 genes
+gene_vars <- sapply(train_data[, gene_cols], var, na.rm = TRUE)
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:20]
+
+X_train <- train_data[, top_genes]
+X_test  <- test_data[, top_genes]
+
+y_train <- train_data$activity
+y_test  <- test_data$activity
+
+# -----------------------------
+# 3. HANDLE IMBALANCE (VERY IMPORTANT)
+# -----------------------------
+class_counts <- table(y_train)
+minority_n <- min(class_counts)
+
+rf_model <- randomForest(
+  x = X_train,
+  y = y_train,
+  ntree = 500,
+  mtry = floor(sqrt(ncol(X_train))),
+  sampsize = c(minority_n, minority_n),  # balanced sampling
+  importance = TRUE
+)
+
+print(rf_model)
+
+# -----------------------------
+# 4. PREDICT
+# -----------------------------
+pred_class <- predict(rf_model, X_test, type = "response")
+pred_prob  <- predict(rf_model, X_test, type = "prob")[, "Active"]
+
+# -----------------------------
+# 5. EVALUATE
+# -----------------------------
+cm <- confusionMatrix(pred_class, y_test, positive = "Active")
+print(cm)
+
+roc_obj <- roc(y_test, pred_prob, levels = c("Inactive", "Active"))
+cat("AUC:", auc(roc_obj), "\n")
+```
+
+```{r}
+library(xgboost)
+library(caret)
+library(pROC)
+
+set.seed(42)
+
+# -----------------------------
+# 1. PREP DATA
+# -----------------------------
+y_train_num <- ifelse(y_train == "Active", 1, 0)
+y_test_num  <- ifelse(y_test == "Active", 1, 0)
+
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train_num)
+dtest  <- xgb.DMatrix(data = as.matrix(X_test), label = y_test_num)
+
+# handle imbalance
+scale_pos_weight <- sum(y_train == "Inactive") / sum(y_train == "Active")
+
+# -----------------------------
+# 2. TRAIN MODEL
+# -----------------------------
+xgb_model <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = 4,
+    eta = 0.1,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    scale_pos_weight = scale_pos_weight
+  ),
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+# -----------------------------
+# 3. PREDICT
+# -----------------------------
+pred_prob <- predict(xgb_model, dtest)
+
+pred_class <- ifelse(pred_prob > 0.5, "Active", "Inactive")
+pred_class <- factor(pred_class, levels = c("Inactive", "Active"))
+
+# -----------------------------
+# 4. EVALUATE
+# -----------------------------
+cm <- confusionMatrix(pred_class, y_test, positive = "Active")
+print(cm)
+
+roc_obj <- roc(y_test, pred_prob, levels = c("Inactive", "Active"))
+cat("AUC:", auc(roc_obj), "\n")
+```
+
+```{r}
+install.packages("xgboost")
+```
+
+```{r}
+library(caret)
+library(pROC)
+
+set.seed(42)
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "smote"
+)
+
+glmnet_fit <- train(
+  x = X_train,
+  y = y_train,
+  method = "glmnet",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneLength = 10
+)
+
+print(glmnet_fit)
+
+# -----------------------------
+# PREDICT
+# -----------------------------
+pred_prob <- predict(glmnet_fit, X_test, type = "prob")[, "Active"]
+
+pred_class <- ifelse(pred_prob > 0.5, "Active", "Inactive")
+pred_class <- factor(pred_class, levels = c("Inactive", "Active"))
+
+cm <- confusionMatrix(pred_class, y_test, positive = "Active")
+print(cm)
+
+roc_obj <- roc(y_test, pred_prob, levels = c("Inactive", "Active"))
+cat("AUC:", auc(roc_obj), "\n")
+```
