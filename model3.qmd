@@ -1,0 +1,683 @@
+---
+title: "Model 3 - Response to SLE treatment "
+subtitle: "DATA3888 · Biomed9"
+author: "Jillian"
+date: today
+bibliography: ref.bib
+link-citations: true
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    fig-width: 8
+    fig-height: 5
+    fig-align: center
+    highlight-style: github
+    smooth-scroll: true
+    link-external-newwindow: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+## Dataset
+
+This analysis uses **GSE224705**, a human whole-blood gene expression dataset focused on **lupus nephritis treatment response**. While the samples contain **RMA-normalised microarray** expression values. The biological aim is to understand why some patients do **not respond** to common therapies such as mycophenolate mofetil (MMF), azathioprine (AZA), hydroxychloroquine (HC). The GEO summary says the cohort contains longitudinal gene-expression and clinical data from responders and non-responders, with response defined over time using **SRI-4 scores**.
+
+The accession page is available at <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE224705>.
+
+## Research question
+
+How do SLE patients respond to specific treatments?
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(GEOquery)
+library(Biobase)
+library(ggplot2)
+library(randomForest)
+library(Boruta)
+library(limma)
+library(glmnet)
+```
+
+## Loading the data
+
+The data for this analysis are obtained from the Gene Expression Omnibus (GEO) accession GSE224705.
+
+Code chunk `load-geo-metadata` retrieves the GEO dataset and loads sample metadata including both expression labels and clinical variables as well as the expression matrix. The dataset has 448 samples, and 54715 probes for each sample.
+
+```{r}
+#| label: load-geo-metadata
+#| message: false
+gse <- getGEO("GSE224705", GSEMatrix = TRUE)
+sample_metadata <- pData(gse[[1]])
+feature_data <- fData(gse[[1]])
+exprs_mat <- exprs(gse[[1]])
+dim(exprs_mat)
+```
+
+## Exploratory data analysis
+
+### Important metadata fields and outcome variable
+
+Code chunk `explore-metadata` checks 10 rows of `sample_metadata`, explores relevant fields, and captures differences between healthy controls and SLE patients. And code chunk `check-field-values` checks values of treatment response, drug groups, and disease activity levels.
+
+Key fields include:
+
+- `title`: patient id + no. visit + response. E.g., Pat_24_visit1_NO_response
+
+- `patient_id:ch1`
+
+- `diagnosis:ch1`: SLE or Healthy
+
+- `Sex:ch1`: sex
+
+- `race:ch1`: race
+
+- `age_onset:ch1`: age_onset
+
+- `drug_group:ch1`: MMF, PHC, AZA, HC
+
+- `mmf_or_aza_dosis:ch1`: MMF/AZA dose, depending on the drug group
+
+- `sledai:ch1`: SLEDAI (Systemic Lupus Erythematosus Disease Activity Index); disease activity score
+
+- `summary_disease_activity(act):ch1`: a simplified/coded disease-activity category (1/2/3)
+
+- **Outcome variable** `sri4_response:ch1`: response to drug or not (`YES`/`NO`)
+
+Healthy controls exist; Clinical fields mostly marked as `NA` or `Data_not_available`; No drug given. Less useful for modelling clinical covariates.
+
+```{r}
+#| label: explore-metadata
+#| message: false
+sample_metadata[15:25, ]
+```
+
+```{r}
+#| label: check-field-values
+#| message: false
+unique(sample_metadata$`sri4_response:ch1`)
+unique(sample_metadata$`drug_group:ch1`)
+unique(sample_metadata$`summary_disease_activity(act):ch1`)
+```
+
+Code chunk `extract-outcome` derives the response outcome to treatment according to the `sri4_response:ch1` variable.
+
+```{r}
+#| label: extract-outcome
+table(sample_metadata$`sri4_response:ch1`)
+```
+
+The cohort comprises 300 SLE samples with response to treatment and 128 non-response samples, and 20 healthy controls. Healthy controls are not helpful to the treatment response question.
+
+### Excluding healthy controls
+
+Code chunk `exclude-healthy` filters for SLE-only samples into `sample_metadata_sle`.
+
+```{r}
+#| label: exclude-healthy
+#| message: false
+sample_metadata_sle <- sample_metadata[sample_metadata$`diagnosis:ch1` == "SLE", ]
+```
+
+### First visit patients
+
+Code chunk `first-visit-only` reflects the design choice of using first-visit samples only. This avoids a major issue: later visits may already reflect treatment effect. For example, for samples with visit 2, 3, 4, some predictors may be partially caused by the treatment given previously, which makes the model less like a real pre-treatment risk calculator. With first-visit only, the left 163 samples remains sufficient for classification.
+
+```{r}
+#| label: first-visit-only
+#| message: false
+sample_metadata_visit1 <- sample_metadata_sle[grep("visit1", sample_metadata_sle$title), ]
+dim(sample_metadata_visit1)
+```
+
+### Treatment response distribution
+
+```{r}
+ggplot(sample_metadata_visit1, aes(x = `sri4_response:ch1`)) +
+  geom_bar(fill = "#2C7BB6") +
+  labs(title = "Treatment Response Distribution",
+       x = "Response",
+       y = "Count")
+```
+
+### Response by treatment
+
+```{r}
+ggplot(sample_metadata_visit1, aes(x = `drug_group:ch1`, fill = `sri4_response:ch1`)) +
+  geom_bar(position = "fill") +
+  labs(title = "Response Rate by Treatment",
+       x = "Treatment (drug type)",
+       y = "Proportion") +
+  scale_fill_manual(values = c("lightblue", "pink"))
+```
+
+### Distribution of expression values
+
+Code chunk `exprs-filter` filters the expression matrix for first visit, SLE samples as the metadata.
+
+```{r}
+#| label: exprs-filter
+exprs_mat_visit1 <- exprs_mat[, rownames(sample_metadata_visit1)]
+dim(exprs_mat_visit1)
+```
+
+Code chunk `rpkm-range` summarises the empirical distribution across the full expression matrix.
+
+```{r}
+#| label: exprs-range
+summary(as.vector(exprs_mat_visit1))
+quantile(as.vector(exprs_mat_visit1),
+         probs = c(0.5, 0.9, 0.99, 0.999, 1))
+```
+
+Code chunk `exprs-sample-boxplots` the per-sample distribution of gene expression values as boxplots, with samples ordered and coloured by outcome. The boxplots prove that the expression values have been normalised, as mentioned by the dataset description.
+
+```{r}
+#| label: exprs-sample-boxplots
+#| fig-width: 10
+#| fig-height: 5
+response <- sample_metadata_visit1$`sri4_response:ch1`
+response <- factor(sample_metadata_visit1$`sri4_response:ch1`, 
+                   levels = c("NO", "YES"))
+
+sample_levels <- colnames(exprs_mat_visit1)[
+  order(response, colnames(exprs_mat_visit1))
+]
+
+exprs_long <- data.frame(
+  sample = factor(
+    rep(colnames(exprs_mat_visit1), each = nrow(exprs_mat_visit1)),
+    levels = sample_levels
+  ),
+  expression_value = as.vector(exprs_mat_visit1),
+  outcome = rep(response, each = nrow(exprs_mat_visit1))
+)
+
+ggplot(exprs_long, aes(x = sample, y = expression_value, fill = outcome)) +
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("NO" = "#66c2a5", "YES" = "#fc8d62")) +
+  labs(x = "Sample (one boxplot per sample; N = 163; individual labels suppressed for readability)",
+       y = "RMA-normalised expression value",
+       fill = "Response",
+       title = "Per-sample distribution of expression values") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+### Probe filtering
+
+Code chunk checks useful annotation columns, which include "Gene Symbol" and "Gene Title".
+
+```{r}
+feature_data <- feature_data[rownames(exprs_mat_visit1), ]
+colnames(feature_data)
+```
+
+Code chunk `filter-unannotated-probes` removes probes with missing, empty, or placeholder gene symbols
+
+```{r}
+#| label: filter-unannotated-probes
+keep_gene <- !is.na(feature_data$`Gene Symbol`) &
+  feature_data$`Gene Symbol` != "" &
+  feature_data$`Gene Symbol` != "---"
+
+exprs_gene_annotated <- exprs_mat_visit1[keep_gene, ]
+feature_gene_annotated <- feature_data[keep_gene, ]
+
+dim(exprs_gene_annotated)
+```
+
+There exist Affymetrix control probes, which often start with `AFFX`. These are technical controls, not biological genes. Code chunk `filter-control-probes` filters out control probes to avoid these becoming predictors in the later models.
+
+```{r}
+#| label: filter-control-probes
+probe_ids <- rownames(exprs_gene_annotated)
+
+keep_non_control <- !grepl("^AFFX", probe_ids)
+
+exprs_no_control <- exprs_gene_annotated[keep_non_control, ]
+feature_gene_no_control <- feature_gene_annotated[keep_non_control, ]
+
+dim(exprs_no_control)
+```
+
+### Collapse multiple probes per gene
+
+Code chunk `collapse-multiple-probes` handles the issue where multiple probes still map to the same gene. Such probes are collapsed so each gene appears once.
+
+```{r}
+#| label: collapse-multiple-probes
+gene_symbol <- feature_gene_no_control$`Gene Symbol`
+
+probe_var <- apply(exprs_no_control, 1, var, na.rm = TRUE)
+
+probe_info <- data.frame(
+  probe_id = rownames(exprs_no_control),
+  gene_symbol = gene_symbol,
+  probe_var = probe_var
+)
+
+# Keep highest-variance probe for each gene
+probe_info <- probe_info[order(probe_info$gene_symbol, -probe_info$probe_var), ]
+
+best_probe_per_gene <- probe_info[!duplicated(probe_info$gene_symbol), ]
+
+exprs_mat_visit1_clean <- exprs_no_control[best_probe_per_gene$probe_id, ]
+
+# Rename rows from probe IDs to gene symbols
+rownames(exprs_mat_visit1_clean) <- best_probe_per_gene$gene_symbol
+
+dim(exprs_mat_visit1_clean)
+```
+
+### Highly expressed probes
+
+Code chunk `top-expressed-transcripts` reports the ten genes with the highest mean RPKM across the cohort. This serves as a biological sanity check: in whole blood, the most abundant transcripts are expected to derive from blood and immune cells.
+
+```{r}
+#| label: top-expressed-transcripts
+gene_mean_expression <- sort(rowMeans(exprs_mat_visit1_clean), decreasing = TRUE)
+head(gene_mean_expression, 10)
+```
+
+The ranking is dominated by genes expressed in white blood cells: `S100A9` (a neutrophil marker), `B2M`, `HLA-B`, and `HLA-C` (components of the MHC class I antigen-presentation system [@wiki_mhc_class_i]), and `LYZ` (lysozyme, an antimicrobial enzyme). The presence of `IFITM2`, a gene activated by interferon signalling [@wiki_interferon], is consistent with the known role of interferon activity in SLE biology. Entries with the `LOC100...` prefix correspond to uncharacterised genomic regions whose expression follows that of nearby annotated genes.
+
+### Principal component analysis
+
+Code chunk `pca-fit` performs a scaled principal component analysis on the cleaned expression matrix. The variance contributions of the first 10 components are reported.
+
+```{r}
+#| label: pca-fit
+pca_fit <- prcomp(t(exprs_mat_visit1_clean), center = TRUE, scale. = TRUE)
+
+variance_explained <- summary(pca_fit)$importance["Proportion of Variance", 1:10]
+
+scree_df <- data.frame(
+  pc = factor(paste0("PC", 1:10), levels = paste0("PC", 1:10)),
+  variance = as.numeric(variance_explained)
+)
+
+ggplot(scree_df, aes(x = pc, y = variance)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = sprintf("%.1f%%", 100 * variance)),
+            vjust = -0.4, size = 3) +
+  labs(x = "Principal component", y = "Proportion of variance explained",
+       title = "Variance explained by the first ten principal components") +
+  theme_minimal()
+```
+
+Code chunk `pca-plot` projects each sample onto the first two principal components and colours the result by response outcome.
+
+```{r}
+#| label: pca-plot
+pc_scores <- data.frame(
+  PC1 = pca_fit$x[, 1],
+  PC2 = pca_fit$x[, 2],
+  outcome = sample_metadata_visit1$`sri4_response:ch1`
+)
+
+ggplot(pc_scores, aes(x = PC1, y = PC2, colour = outcome)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  scale_colour_manual(values = c("NO" = "#66c2a5", "YES" = "#fc8d62")) +
+  labs(title = "Sample scores on the first two principal components",
+       colour = "Outcome") +
+  theme_minimal()
+```
+
+Code chunk `pca-loadings` reports the genes contributing most strongly to PC1 and PC2 by absolute loading. These are the genes that drive the dominant variance structure of the dataset and are natural candidates for inclusion in a downstream classifier.
+
+```{r}
+#| label: pca-loadings
+
+pc1_loadings <- pca_fit$rotation[, "PC1"]
+pc2_loadings <- pca_fit$rotation[, "PC2"]
+
+top_pc1_genes <- names(sort(abs(pc1_loadings), decreasing = TRUE))[1:15]
+top_pc2_genes <- names(sort(abs(pc2_loadings), decreasing = TRUE))[1:15]
+
+data.frame(
+  pc1_gene    = top_pc1_genes,
+  pc1_loading = round(pc1_loadings[top_pc1_genes], 4),
+  pc2_gene    = top_pc2_genes,
+  pc2_loading = round(pc2_loadings[top_pc2_genes], 4),
+  row.names   = NULL
+)
+```
+
+## Feature Extraction 
+
+The pre-processed expression matrix contains 20741 genes for 163 samples. We now do a feature selection step before fitting any classifiers.
+
+### Pre-filtering low-expression and low-variance genes
+
+Code chunk `feature-prefilter` discards genes that are expressed at near-baseline levels across the cohort (mean expression value \< 1) and restricts the retained set to the 2,000 genes with the highest variance among those passing the expression threshold. Pre-filtering removes features that contribute only measurement noise and is required for the wrapper-based Boruta procedure to run in tractable time.
+
+```{r}
+#| label: feature-prefilter
+gene_means <- rowMeans(exprs_mat_visit1_clean)
+gene_variances <- apply(exprs_mat_visit1_clean, 1, var)
+
+expressed_indices <- which(gene_means > 1)
+variance_ranking <- order(gene_variances[expressed_indices], decreasing = TRUE)
+selected_indices <- expressed_indices[variance_ranking[1:2000]]
+
+exprs_mat_filtered <- exprs_mat_visit1_clean[selected_indices, ]
+dim(exprs_mat_filtered)
+```
+
+### Random forest with Gini importance
+
+Code chunk `rf-importance` fits a random forest of 500 trees to the pre-filtered matrix and ranks features by mean decrease in Gini impurity. Permutation importance remains the more rigorous choice for a final committed selection.
+
+```{r}
+#| label: rf-importance
+#| fig-height: 6
+#| cache: true
+set.seed(42)
+
+response_outcome <- factor(
+  sample_metadata_visit1$`sri4_response:ch1`,
+  levels = c("NO", "YES"))
+
+rf_fit <- randomForest(
+  x = t(exprs_mat_filtered),
+  y = response_outcome,
+  ntree = 500,
+  importance = TRUE
+)
+
+rf_gini <- importance(rf_fit, type = 2)
+rf_ranking <- sort(rf_gini[, "MeanDecreaseGini"], decreasing = TRUE)
+
+top_rf <- head(rf_ranking, 20)
+top_rf_df <- data.frame(
+  gene = factor(names(top_rf), levels = rev(names(top_rf))),
+  gini_importance = as.numeric(top_rf)
+)
+
+ggplot(top_rf_df, aes(x = gini_importance, y = gene)) +
+  geom_col(fill = "steelblue") +
+  labs(x = "Mean decrease in Gini impurity",
+       y = "Gene",
+       title = "Top 20 features by random forest Gini importance") +
+  theme_minimal()
+```
+
+### Boruta
+
+Code chunk `boruta-fit` runs Boruta with 100 iterations on the pre-filtered matrix.
+
+```{r}
+#| label: boruta-fit
+#| cache: true
+set.seed(42)
+boruta_fit <- Boruta(
+  x = t(exprs_mat_filtered),
+  y = response_outcome,
+  maxRuns = 100,
+  doTrace = 0
+)
+
+table(boruta_fit$finalDecision)
+```
+
+Code chunk `boruta-confirmed` lists the number of features that Boruta classifies as confirmed and reports the first thirty by name.
+
+```{r}
+#| label: boruta-confirmed
+confirmed_features <- getSelectedAttributes(boruta_fit, withTentative = FALSE)
+length(confirmed_features)
+confirmed_features
+```
+
+### Elastic net
+
+### Overlap genes
+
+Code chunk `overlap-genes` compares the top genes selected by both methods, and checks any overlaps.
+
+```{r}
+#| label: overlap-genes
+rf_gini_genes <- rf_ranking[1:20]
+boruta_genes <- confirmed_features
+overlap_genes <- intersect(rf_gini_genes, boruta_genes)
+overlap_genes
+```
+
+## Modelling
+
+Three classifiers are fitted and compared on the curated feature panel: a limma-based signature classifier, a random forest, and an L1-penalised logistic regression (LASSO). All three are evaluated by the same stratified 5-fold cross-validation scheme so that performance is directly comparable. Limma is a per-gene regression method, so its regression output (log fold-changes and adjusted p-values) is reported alongside the cross-validated class predictions. Random forest and LASSO are classifiers, so only the cross-validated class predictions are reported.
+
+### **TODO: Curated feature panel**
+
+Features unrelated to predictive performance need to be excluded from the modelling panel.
+
+Need further research on the categories of those.
+
+### Cross-validation scheme
+
+Code chunk `cv-folds` constructs a single set of stratified 5-fold assignments. The same fold structure is used for all three models.
+
+```{r}
+#| label: cv-folds
+make_stratified_folds <- function(y, k, seed) {
+  set.seed(seed)
+  fold_id <- integer(length(y))
+  for (cls in levels(y)) {
+    cls_idx <- which(y == cls)
+    fold_id[cls_idx] <- sample(rep(seq_len(k), length.out = length(cls_idx)))
+  }
+  fold_id
+}
+
+cv_folds <- make_stratified_folds(response_outcome, k = 5, seed = 42)
+table(cv_folds, response_outcome)
+```
+
+### Limma differential expression and class predictions
+
+Code chunk `limma-de` fits a per-gene linear model (`outcome` as the only covariate) on the pre-filtered 2,000-gene matrix with empirical-Bayes shrinkage of variance estimates. The top 20 differentially expressed genes by adjusted p-value are reported as the regression output.
+
+```{r}
+#| label: limma-de
+limma_design <- model.matrix(~ response_outcome)
+limma_fit <- eBayes(lmFit(exprs_mat_filtered, limma_design))
+
+limma_top <- topTable(limma_fit, coef = 2, number = Inf,
+                      adjust.method = "BH", sort.by = "P")
+head(limma_top, 20)
+```
+
+Code chunk `limma-signature-cv` produces class predictions by a simple signature-score procedure. Within each cross-validation fold, limma was fitted using only the training samples to identify genes differentially expressed between responders (YES) and non-responders (NO). The top 10 genes were weighted by their limma t-statistics, where positive weights indicated higher expression in responders and negative weights indicated higher expression in non-responders. Held-out samples were scored using the weighted expression signature, and classification was performed using a prevalence-matched threshold estimated from the training scores.
+
+```{r}
+#| label: limma-signature-cv
+
+limma_score <- numeric(length(response_outcome))
+limma_class <- factor(rep(NA, length(response_outcome)),
+                      levels = levels(response_outcome))
+
+for (k in seq_len(max(cv_folds))) {
+  test_idx  <- which(cv_folds == k)
+  train_idx <- setdiff(seq_along(cv_folds), test_idx)
+
+  design_train <- model.matrix(~ response_outcome[train_idx])
+  fit_train <- eBayes(lmFit(exprs_mat_filtered[, train_idx], design_train))
+  top <- topTable(fit_train, coef = 2, number = 10, sort.by = "P")
+  top_genes <- rownames(top)
+  weights   <- top$t
+
+  train_score <- as.numeric(
+    t(exprs_mat_filtered[top_genes, train_idx, drop = FALSE]) %*% weights
+  )
+  test_score <- as.numeric(
+    t(exprs_mat_filtered[top_genes, test_idx,  drop = FALSE]) %*% weights
+  )
+
+  yes_prevalence <- mean(response_outcome[train_idx] == "YES")
+  threshold <- as.numeric(
+    quantile(train_score, probs = 1 - yes_prevalence)
+  )
+
+  limma_score[test_idx] <- test_score - threshold
+  limma_class[test_idx] <- factor(
+    ifelse(test_score > threshold, "YES", "NO"),
+    levels = levels(response_outcome)
+  )
+}
+
+limma_cv <- list(score = limma_score, class = limma_class)
+
+table(true = response_outcome, predicted = limma_cv$class)
+```
+
+### Random forest classifier
+
+Code chunk `rf-classifier-cv` fits a random forest of 500 trees to the pre-filtered expression matrix within each cross-validation fold. Both the predicted class and the predicted response (YES) probability (the proportion of trees voting for YES) are recorded for each held-out sample.
+
+```{r}
+#| label: rf-classifier-cv
+
+rf_class <- factor(rep(NA, length(response_outcome)),
+                   levels = levels(response_outcome))
+rf_prob <- numeric(length(response_outcome))
+
+for (k in seq_len(max(cv_folds))) {
+  test_idx  <- which(cv_folds == k)
+  train_idx <- setdiff(seq_along(cv_folds), test_idx)
+
+  set.seed(42 + k)
+  rf_fold <- randomForest(
+    x = t(exprs_mat_filtered[, train_idx]),
+    y = response_outcome[train_idx],
+    ntree = 500
+  )
+  test_x <- t(exprs_mat_filtered[, test_idx])
+  rf_class[test_idx] <- predict(rf_fold, newdata = test_x)
+  rf_prob[test_idx]  <- predict(rf_fold, newdata = test_x, type = "prob")[, "YES"]
+}
+rf_cv <- list(class = rf_class, prob = rf_prob)
+
+table(true = response_outcome, predicted = rf_cv$class)
+```
+
+The random forest model seems to learn predicting YES well, but has a very bad performance on predicting NO. This is mainly because Random Forest is using the default majority-vote rule, and the dataset is imbalanced.
+
+### LASSO logistic regression
+
+Code chunk `lasso-classifier-cv` fits an L1-penalised logistic regression to the pre-filtered expression matrix within each outer cross-validation fold. Within each fold an inner cross-validation (`cv.glmnet`) selects the regularisation parameter by minimising binomial deviance; the resulting model is then applied to the held-out outer-fold samples.
+
+```{r}
+#| label: lasso-classifier-cv
+
+lasso_class <- factor(rep(NA, length(response_outcome)),
+                      levels = levels(response_outcome))
+lasso_prob <- numeric(length(response_outcome))
+
+for (k in seq_len(max(cv_folds))) {
+  test_idx  <- which(cv_folds == k)
+  train_idx <- setdiff(seq_along(cv_folds), test_idx)
+
+  set.seed(42 + k)
+  glmnet_fit <- cv.glmnet(
+    x = t(exprs_mat_filtered[, train_idx]),
+    y = response_outcome[train_idx],
+    family = "binomial",
+    alpha = 1,
+    nfolds = 5
+  )
+  test_x <- t(exprs_mat_filtered[, test_idx])
+  lasso_class[test_idx] <- factor(
+    predict(glmnet_fit, newx = test_x, s = "lambda.min", type = "class")[, 1],
+    levels = levels(response_outcome)
+  )
+  lasso_prob[test_idx] <- predict(glmnet_fit, newx = test_x,
+                                  s = "lambda.min", type = "response")[, 1]
+}
+lasso_cv <- list(class = lasso_class, prob = lasso_prob)
+
+table(true = response_outcome, predicted = lasso_cv$class)
+```
+
+Similar result as Random Forest, the model is basically saying almost everyone is a responder.
+
+### TODO: Elastic net
+
+### Performance summary
+
+Code chunk `performance-summary` reports the standard metrics for binary classification on imbalanced data: overall accuracy, balanced accuracy, per-class F1, macro-averaged F1, the Matthews correlation coefficient (MCC), and AUROC computed from the model's continuous output. For imbalanced data, MCC is more informative than accuracy because it punishes models that simply predict the majority class.
+
+For treatment response prediction, we would rather favour errors that classify people with NO response to YES, than classify people that actually respond to treatment (YES) to NO. In this setting, we do not incorrectly provide no treatment to patients who do need one.
+
+```{r}
+#| label: performance-summary
+score_predictions <- function(true_labels, predicted_class,
+                              score = NULL, positive = "YES") {
+  cm <- table(true = true_labels, predicted = predicted_class)
+
+  tp <- cm[positive, positive]
+  fn <- sum(cm[positive, ]) - tp
+  fp <- sum(cm[, positive]) - tp
+  tn <- sum(cm) - tp - fn - fp
+
+  recall_yes  <- tp / (tp + fn)
+  recall_no <- tn / (tn + fp)
+  precision_yes  <- if ((tp + fp) > 0) tp / (tp + fp) else NA_real_
+  precision_no <- if ((tn + fn) > 0) tn / (tn + fn) else NA_real_
+
+  f1 <- function(prec, rec) {
+    if (is.na(prec) || is.na(rec) || (prec + rec) == 0) NA_real_
+    else 2 * prec * rec / (prec + rec)
+  }
+
+  f1_yes  <- f1(precision_yes,  recall_yes)
+  f1_no <- f1(precision_no, recall_no)
+
+  mcc_denom <- sqrt(as.numeric(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+  mcc <- if (mcc_denom == 0) 0 else (tp * tn - fp * fn) / mcc_denom
+
+  out <- c(
+    accuracy          = (tp + tn) / sum(cm),
+    balanced_accuracy = (recall_yes + recall_no) / 2,
+    f1_yes            = f1_yes,
+    f1_control        = f1_no,
+    macro_f1          = mean(c(f1_yes, f1_no), na.rm = TRUE),
+    mcc               = mcc
+  )
+
+  if (!is.null(score)) {
+    pos <- score[true_labels == positive]
+    neg <- score[true_labels != positive]
+    auroc <- (sum(outer(pos, neg, ">")) + 0.5 * sum(outer(pos, neg, "=="))) /
+             (length(pos) * length(neg))
+    out <- c(out, auroc = auroc)
+  }
+  out
+}
+
+performance_table <- rbind(
+  Limma           = score_predictions(response_outcome, limma_cv$class, limma_cv$score),
+  `Random forest` = score_predictions(response_outcome, rf_cv$class,    rf_cv$prob),
+  LASSO           = score_predictions(response_outcome, lasso_cv$class, lasso_cv$prob)
+)
+
+round(performance_table, 3)
+```
+
+### TODO: explore alternatives to highly imbalanced data
