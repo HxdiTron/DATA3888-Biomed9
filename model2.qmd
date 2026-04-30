@@ -1,7 +1,7 @@
 ---
 title: "Model 2 - Disease progression prediction in SLE"
 subtitle: "DATA3888 · Biomed9"
-author: "Udit Samant"
+author: "Manna Berry"
 date: today
 format:
   html:
@@ -13,12 +13,6 @@ format:
     embed-resources: true
     code-fold: show
     code-tools: true
-    df-print: paged
-    fig-width: 8
-    fig-height: 5
-    fig-align: center
-    highlight-style: github
-    smooth-scroll: true
 execute:
   warning: false
   message: false
@@ -27,29 +21,36 @@ editor: visual
 
 ## Background
 
-### Systemic lupus erythematosus
+- Systemic lupus erythematosus (SLE) is a chronic autoimmune disease characterised by fluctuating disease activity over time.
+- Disease activity is measured using the SLEDAI score, where higher values indicate greater disease severity.
+- Predicting future disease activity is clinically important, as it may allow earlier intervention.
+- This model focuses on **disease progression**, predicting next-visit activity rather than diagnosis.
+- The problem is challenging due to high-dimensional gene-expression data and non-linear disease trajectories.
 
-\[WRITE HERE\]
-
-### Disease progression over time
-
-\[WRITE HERE\]
+---
 
 ## Dataset
 
-This analysis uses two longitudinal SLE gene-expression datasets: **GSE65391** and **GSE49454**. Both contain repeated patient visits, SLEDAI disease activity scores, and whole-blood gene-expression measurements. The target variable is the patient's **next-visit disease activity**, classified as Active or Inactive using SLEDAI.
+- Training dataset: **GSE65391**
+- External validation dataset: **GSE49454**
+- Both datasets contain:
+  - Longitudinal patient visits
+  - SLEDAI scores
+  - Whole-blood gene expression
+- Outcome:
+  - **next_activity (Active vs Inactive)** using SLEDAI ≥ 4
+
+---
 
 ## Research question
 
-Can current-visit gene expression and recent clinical trajectory predict whether SLE disease activity will be Active or Inactive at the next recorded visit?
+- Can gene expression and clinical trajectory at the current visit predict whether a patient will be Active or Inactive at the next visit?
+
+---
 
 ## Setup
 
 ```{r}
-#| label: setup
-#| message: false
-#| warning: false
-
 library(GEOquery)
 library(Biobase)
 library(dplyr)
@@ -66,13 +67,25 @@ set.seed(42)
 options(timeout = 600)
 ```
 
+---
+
 ## Helper functions
 
 ```{r}
-#| label: helper-functions
+safe_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
 
-safe_numeric <- function(x) {
-  suppressWarnings(as.numeric(as.character(x)))
+load_gse_cached <- function(gse_id) {
+  cache_dir <- ".cache"
+  if (!dir.exists(cache_dir)) dir.create(cache_dir)
+  cache_file <- file.path(cache_dir, paste0(gse_id, "_gse.rds"))
+  
+  if (file.exists(cache_file)) {
+    readRDS(cache_file)
+  } else {
+    gse <- getGEO(gse_id, GSEMatrix = TRUE)
+    saveRDS(gse, cache_file)
+    gse
+  }
 }
 
 get_first_existing_col <- function(meta, possible_cols) {
@@ -80,907 +93,212 @@ get_first_existing_col <- function(meta, possible_cols) {
   if (length(existing) == 0) return(NULL)
   existing[1]
 }
+```
 
-load_gse_cached <- function(gse_id) {
-  cache_dir <- ".cache"
-  if (!dir.exists(cache_dir)) dir.create(cache_dir)
-  
-  cache_file <- file.path(cache_dir, paste0(gse_id, "_gse.rds"))
-  
-  if (file.exists(cache_file)) {
-    gse <- readRDS(cache_file)
-  } else {
-    gse <- getGEO(gse_id, GSEMatrix = TRUE)
-    saveRDS(gse, cache_file)
-  }
-  
-  gse
-}
+---
 
-find_symbol_column <- function(feature_data) {
-  possible_cols <- c(
-    "Gene Symbol", "gene_assignment", "Symbol", "SYMBOL",
-    "Gene.symbol", "GENE_SYMBOL", "ILMN_Gene"
-  )
-  
-  existing <- possible_cols[possible_cols %in% colnames(feature_data)]
-  
-  if (length(existing) == 0) return(NULL)
-  existing[1]
-}
+## Data processing
 
-clean_gene_symbol <- function(x) {
-  x <- as.character(x)
-  x <- sub("///.*", "", x)
-  x <- sub("//.*", "", x)
-  x <- sub(";.*", "", x)
-  x <- sub(",.*", "", x)
-  x <- trimws(x)
-  x[x == "" | is.na(x)] <- NA
-  x
-}
-
-collapse_expression_to_symbols <- function(expr, feature_data) {
-  
-  symbol_col <- find_symbol_column(feature_data)
-  
-  if (is.null(symbol_col)) {
-    message("No gene-symbol column found. Using probe IDs as features.")
-    expr_symbol <- expr
-    rownames(expr_symbol) <- make.names(rownames(expr_symbol), unique = TRUE)
-    return(expr_symbol)
-  }
-  
-  symbols <- clean_gene_symbol(feature_data[[symbol_col]])
-  
-  keep <- !is.na(symbols)
-  expr <- expr[keep, , drop = FALSE]
-  symbols <- symbols[keep]
-  
-  symbols <- make.names(symbols)
-  
-  expr_df <- as.data.frame(expr)
-  expr_df$gene_symbol <- symbols
-  
-  collapsed <- expr_df %>%
-    group_by(gene_symbol) %>%
-    summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
-  
-  collapsed_mat <- as.matrix(collapsed[, -1])
-  rownames(collapsed_mat) <- collapsed$gene_symbol
-  
-  collapsed_mat
-}
-
+```{r}
 make_activity_dataset <- function(gse_id, dataset_name) {
   
   gse <- load_gse_cached(gse_id)
-  
   eset <- gse[[1]]
-  expr_raw <- exprs(eset)
+  
+  expr <- exprs(eset)
   meta <- pData(eset)
-  fdat <- fData(eset)
   
-  expr <- collapse_expression_to_symbols(expr_raw, fdat)
-  
+  rownames(expr) <- make.names(rownames(expr), unique = TRUE)
   meta$geo_accession <- rownames(meta)
   
-  patient_col <- get_first_existing_col(
-    meta,
-    c("subject:ch1", "patient:ch1", "patient_id:ch1", "id:ch1")
-  )
+  patient_col <- get_first_existing_col(meta, c("subject:ch1","patient:ch1"))
+  visit_col <- get_first_existing_col(meta, c("visit:ch1"))
+  sledai_col <- get_first_existing_col(meta, c("sledai:ch1","SLEDAI:ch1"))
   
-  visit_col <- get_first_existing_col(
-    meta,
-    c("visit:ch1", "time:ch1", "week:ch1")
-  )
+  meta$patient <- ifelse(is.null(patient_col),
+                         sub("V[0-9]+$", "", meta$title),
+                         meta[[patient_col]])
   
-  sledai_col <- get_first_existing_col(
-    meta,
-    c("sledai:ch1", "SLEDAI:ch1", "sledai", "SLEDAI")
-  )
-  
-  if (is.null(sledai_col)) {
-    stop(paste("Could not find SLEDAI column for", gse_id))
-  }
-  
-  if (is.null(patient_col)) {
-    meta$patient <- sub("V[0-9]+$", "", meta$title)
-  } else {
-    meta$patient <- meta[[patient_col]]
-  }
-  
-  if (is.null(visit_col)) {
-    meta$visit <- safe_numeric(sub(".*V", "", meta$title))
-  } else {
-    meta$visit <- safe_numeric(meta[[visit_col]])
-  }
+  meta$visit <- ifelse(is.null(visit_col),
+                       safe_numeric(sub(".*V","",meta$title)),
+                       safe_numeric(meta[[visit_col]]))
   
   meta$sledai <- safe_numeric(meta[[sledai_col]])
+  
   meta$activity <- ifelse(meta$sledai >= 4, "Active", "Inactive")
-  meta$activity <- factor(meta$activity, levels = c("Active", "Inactive"))
-  meta$dataset <- dataset_name
+  meta$activity <- factor(meta$activity, levels=c("Active","Inactive"))
   
   expr_df <- as.data.frame(t(expr))
   expr_df$geo_accession <- rownames(expr_df)
   
-  data <- merge(meta, expr_df, by = "geo_accession")
+  data <- merge(meta, expr_df, by="geo_accession")
   
   data <- data %>%
-    filter(!is.na(patient), !is.na(visit), !is.na(sledai), !is.na(activity)) %>%
     arrange(patient, visit) %>%
     group_by(patient) %>%
     mutate(
       previous_sledai = lag(sledai),
       current_change = sledai - previous_sledai,
-      next_sledai = lead(sledai),
       next_activity = lead(activity)
     ) %>%
     ungroup() %>%
     filter(!is.na(next_activity))
   
-  data$next_activity <- factor(data$next_activity, levels = c("Active", "Inactive"))
+  data$next_activity <- factor(data$next_activity, levels=c("Active","Inactive"))
   data$current_change[is.na(data$current_change)] <- 0
-  data$previous_sledai[is.na(data$previous_sledai)] <- data$sledai[is.na(data$previous_sledai)]
   
-  list(
-    expr = expr,
-    meta = meta,
-    data = data,
-    expr_df = expr_df
-  )
+  list(expr=expr, data=data)
 }
 
-patient_split <- function(data, patient_col = "patient", outcome_col = "next_activity",
-                          p = 0.7, seed = 42) {
-  
-  set.seed(seed)
-  
-  patient_summary <- data %>%
-    group_by(.data[[patient_col]]) %>%
-    summarise(
-      outcome_majority = names(sort(table(.data[[outcome_col]]), decreasing = TRUE))[1],
-      .groups = "drop"
-    )
-  
-  train_patients_idx <- createDataPartition(
-    factor(patient_summary$outcome_majority),
-    p = p,
-    list = FALSE
-  )
-  
-  train_patients <- patient_summary[[patient_col]][train_patients_idx]
-  
-  train_idx <- which(data[[patient_col]] %in% train_patients)
-  test_idx <- setdiff(seq_len(nrow(data)), train_idx)
-  
-  list(train_idx = train_idx, test_idx = test_idx)
-}
-
-find_best_threshold <- function(y_true, probs) {
-  
-  thresholds <- seq(0.1, 0.9, by = 0.01)
-  
-  scores <- sapply(thresholds, function(t) {
-    
-    pred <- factor(
-      ifelse(probs >= t, "Active", "Inactive"),
-      levels = c("Active", "Inactive")
-    )
-    
-    cm <- confusionMatrix(pred, y_true, positive = "Active")
-    as.numeric(cm$byClass["Balanced Accuracy"])
-  })
-  
-  thresholds[which.max(scores)]
-}
-
-evaluate_binary_model <- function(pred_class, pred_prob, y_test, model_name) {
-  
-  pred_class <- factor(pred_class, levels = c("Active", "Inactive"))
-  y_test <- factor(y_test, levels = c("Active", "Inactive"))
-  
-  cm <- confusionMatrix(pred_class, y_test, positive = "Active")
-  
-  roc_obj <- roc(
-    response = y_test,
-    predictor = pred_prob,
-    levels = c("Inactive", "Active"),
-    quiet = TRUE
-  )
-  
-  data.frame(
-    Model = model_name,
-    Accuracy = as.numeric(cm$overall["Accuracy"]),
-    Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"]),
-    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
-    Specificity = as.numeric(cm$byClass["Specificity"]),
-    AUC = as.numeric(auc(roc_obj))
-  )
-}
-
-make_class_weights <- function(y) {
-  tab <- table(y)
-  weights <- sum(tab) / (length(tab) * tab)
-  weights
-}
-
-make_observation_weights <- function(y) {
-  cw <- make_class_weights(y)
-  as.numeric(cw[as.character(y)])
-}
-
-best_tune_predictions <- function(model) {
-  pred <- model$pred
-  best <- model$bestTune
-  
-  for (nm in names(best)) {
-    pred <- pred[pred[[nm]] == best[[nm]], ]
-  }
-  
-  pred
-}
-
-add_module_scores <- function(X_train_full, X_test_full) {
-  
-  interferon_genes <- make.names(c(
-    "IFI44", "IFI44L", "MX1", "ISG15", "OAS1", "OAS2",
-    "OAS3", "IFIT1", "IFIT2", "IFIT3", "RSAD2", "IRF7",
-    "STAT1", "XAF1", "USP18", "EPSTI1"
-  ))
-  
-  inflammation_genes <- make.names(c(
-    "IL1B", "TNF", "CXCL10", "CXCL11", "CCL2", "CCR1",
-    "NFKB1", "NFKBIA", "S100A8", "S100A9"
-  ))
-  
-  bcell_genes <- make.names(c(
-    "CD79A", "CD79B", "MS4A1", "BANK1", "BLK", "TNFRSF13C"
-  ))
-  
-  module_score <- function(X, genes) {
-    present <- intersect(genes, colnames(X))
-    if (length(present) == 0) {
-      return(rep(0, nrow(X)))
-    }
-    rowMeans(X[, present, drop = FALSE], na.rm = TRUE)
-  }
-  
-  train_scores <- data.frame(
-    IFN_score = module_score(X_train_full, interferon_genes),
-    Inflammation_score = module_score(X_train_full, inflammation_genes),
-    Bcell_score = module_score(X_train_full, bcell_genes)
-  )
-  
-  test_scores <- data.frame(
-    IFN_score = module_score(X_test_full, interferon_genes),
-    Inflammation_score = module_score(X_test_full, inflammation_genes),
-    Bcell_score = module_score(X_test_full, bcell_genes)
-  )
-  
-  list(
-    train = train_scores,
-    test = test_scores,
-    ifn_genes_found = intersect(interferon_genes, colnames(X_train_full)),
-    inflammation_genes_found = intersect(inflammation_genes, colnames(X_train_full)),
-    bcell_genes_found = intersect(bcell_genes, colnames(X_train_full))
-  )
-}
-
-prepare_matrices <- function(train_data, test_data, gene_cols,
-                             outcome_col = "next_activity",
-                             include_clinical = TRUE,
-                             include_modules = TRUE,
-                             top_var_n = 2000,
-                             top_limma_n = 300,
-                             final_n = 50) {
-  
-  y_train <- factor(train_data[[outcome_col]], levels = c("Active", "Inactive"))
-  y_test  <- factor(test_data[[outcome_col]], levels = c("Active", "Inactive"))
-  
-  X_train_full <- train_data[, gene_cols, drop = FALSE]
-  X_test_full  <- test_data[, gene_cols, drop = FALSE]
-  
-  X_train_full <- data.frame(lapply(X_train_full, safe_numeric))
-  X_test_full  <- data.frame(lapply(X_test_full, safe_numeric))
-  
-  keep <- sapply(
-    X_train_full,
-    function(x) {
-      gene_var <- var(x, na.rm = TRUE)
-      !all(is.na(x)) && is.finite(gene_var) && gene_var > 0
-    }
-  )
-  
-  X_train_full <- X_train_full[, keep, drop = FALSE]
-  X_test_full  <- X_test_full[, keep, drop = FALSE]
-  
-  train_medians <- sapply(X_train_full, median, na.rm = TRUE)
-  
-  for (j in seq_along(X_train_full)) {
-    X_train_full[is.na(X_train_full[, j]), j] <- train_medians[j]
-    X_test_full[is.na(X_test_full[, j]), j] <- train_medians[j]
-  }
-  
-  module_info <- NULL
-  
-  if (include_modules) {
-    module_info <- add_module_scores(X_train_full, X_test_full)
-  }
-  
-  gene_vars <- sapply(X_train_full, var, na.rm = TRUE)
-  top_var_n <- min(top_var_n, length(gene_vars))
-  var_genes <- names(sort(gene_vars, decreasing = TRUE))[1:top_var_n]
-  
-  X_train_var <- X_train_full[, var_genes, drop = FALSE]
-  X_test_var  <- X_test_full[, var_genes, drop = FALSE]
-  
-  design <- model.matrix(~ y_train)
-  fit <- eBayes(lmFit(t(as.matrix(X_train_var)), design))
-  limma_tab <- topTable(fit, coef = 2, number = Inf, sort.by = "P")
-  
-  top_limma_n <- min(top_limma_n, nrow(limma_tab))
-  limma_genes <- rownames(limma_tab)[1:top_limma_n]
-  
-  X_train_limma <- X_train_var[, limma_genes, drop = FALSE]
-  
-  class_weights_rf <- make_class_weights(y_train)
-  
-  rf_rank_fit <- randomForest(
-    x = X_train_limma,
-    y = y_train,
-    ntree = 500,
-    mtry = max(1, floor(sqrt(ncol(X_train_limma)))),
-    classwt = class_weights_rf,
-    importance = TRUE
-  )
-  
-  rf_imp <- importance(rf_rank_fit, type = 2)
-  rf_rank <- sort(rf_imp[, "MeanDecreaseGini"], decreasing = TRUE)
-  
-  final_n <- min(final_n, length(rf_rank))
-  final_genes <- names(rf_rank)[1:final_n]
-  
-  X_train <- X_train_var[, final_genes, drop = FALSE]
-  X_test  <- X_test_var[, final_genes, drop = FALSE]
-  
-  if (include_modules) {
-    X_train <- cbind(X_train, module_info$train)
-    X_test  <- cbind(X_test, module_info$test)
-  }
-  
-  if (include_clinical) {
-    
-    clinical_train <- data.frame(
-      current_sledai = safe_numeric(train_data$sledai),
-      previous_sledai = safe_numeric(train_data$previous_sledai),
-      current_change = safe_numeric(train_data$current_change),
-      visit = safe_numeric(train_data$visit)
-    )
-    
-    clinical_test <- data.frame(
-      current_sledai = safe_numeric(test_data$sledai),
-      previous_sledai = safe_numeric(test_data$previous_sledai),
-      current_change = safe_numeric(test_data$current_change),
-      visit = safe_numeric(test_data$visit)
-    )
-    
-    clinical_medians <- sapply(clinical_train, median, na.rm = TRUE)
-    
-    for (j in seq_along(clinical_train)) {
-      clinical_train[is.na(clinical_train[, j]), j] <- clinical_medians[j]
-      clinical_test[is.na(clinical_test[, j]), j] <- clinical_medians[j]
-    }
-    
-    X_train <- cbind(X_train, clinical_train)
-    X_test  <- cbind(X_test, clinical_test)
-  }
-  
-  preproc <- preProcess(X_train, method = c("center", "scale"))
-  X_train_scaled <- predict(preproc, X_train)
-  X_test_scaled  <- predict(preproc, X_test)
-  
-  colnames(X_train_scaled) <- make.names(colnames(X_train_scaled))
-  colnames(X_test_scaled)  <- make.names(colnames(X_test_scaled))
-  
-  list(
-    X_train = X_train_scaled,
-    X_test = X_test_scaled,
-    y_train = y_train,
-    y_test = y_test,
-    final_genes = final_genes,
-    limma_table = limma_tab,
-    rf_ranking = rf_rank,
-    module_info = module_info
-  )
-}
-
-train_and_evaluate_models <- function(prepared, label_prefix = "Model") {
-  
-  X_train <- prepared$X_train
-  X_test  <- prepared$X_test
-  y_train <- prepared$y_train
-  y_test  <- prepared$y_test
-  
-  ctrl <- trainControl(
-    method = "repeatedcv",
-    number = 5,
-    repeats = 2,
-    classProbs = TRUE,
-    summaryFunction = twoClassSummary,
-    savePredictions = "final"
-  )
-  
-  class_weights <- make_class_weights(y_train)
-  obs_weights <- make_observation_weights(y_train)
-  
-  set.seed(42)
-  rf_model <- randomForest(
-    x = X_train,
-    y = y_train,
-    ntree = 1000,
-    mtry = max(1, floor(sqrt(ncol(X_train)))),
-    classwt = class_weights,
-    importance = TRUE
-  )
-  
-  rf_prob <- predict(rf_model, X_test, type = "prob")[, "Active"]
-  rf_pred <- factor(
-    ifelse(rf_prob >= 0.5, "Active", "Inactive"),
-    levels = c("Active", "Inactive")
-  )
-  
-  rf_perf <- evaluate_binary_model(
-    rf_pred,
-    rf_prob,
-    y_test,
-    paste(label_prefix, "Random Forest")
-  )
-  
-  set.seed(42)
-  svm_model <- train(
-    x = X_train,
-    y = y_train,
-    method = "svmRadial",
-    metric = "ROC",
-    trControl = ctrl,
-    tuneGrid = expand.grid(
-      sigma = c(0.001, 0.005, 0.01),
-      C = c(0.5, 1, 2, 4)
-    ),
-    class.weights = class_weights
-  )
-  
-  svm_cv <- best_tune_predictions(svm_model)
-  best_thresh_svm <- find_best_threshold(svm_cv$obs, svm_cv$Active)
-  
-  svm_prob <- predict(svm_model, X_test, type = "prob")[, "Active"]
-  svm_pred <- factor(
-    ifelse(svm_prob >= best_thresh_svm, "Active", "Inactive"),
-    levels = c("Active", "Inactive")
-  )
-  
-  svm_perf <- evaluate_binary_model(
-    svm_pred,
-    svm_prob,
-    y_test,
-    paste(label_prefix, "SVM")
-  )
-  
-  set.seed(42)
-  glmnet_model <- train(
-    x = X_train,
-    y = y_train,
-    method = "glmnet",
-    metric = "ROC",
-    weights = obs_weights,
-    trControl = ctrl,
-    tuneGrid = expand.grid(
-      alpha = c(0, 0.25, 0.5, 0.75, 1),
-      lambda = seq(0.001, 0.05, length = 12)
-    )
-  )
-  
-  glmnet_cv <- best_tune_predictions(glmnet_model)
-  best_thresh_glmnet <- find_best_threshold(glmnet_cv$obs, glmnet_cv$Active)
-  
-  glmnet_prob <- predict(glmnet_model, X_test, type = "prob")[, "Active"]
-  glmnet_pred <- factor(
-    ifelse(glmnet_prob >= best_thresh_glmnet, "Active", "Inactive"),
-    levels = c("Active", "Inactive")
-  )
-  
-  glmnet_perf <- evaluate_binary_model(
-    glmnet_pred,
-    glmnet_prob,
-    y_test,
-    paste(label_prefix, "Elastic Net")
-  )
-  
-  performance <- rbind(rf_perf, svm_perf, glmnet_perf)
-  performance[, -1] <- round(performance[, -1], 3)
-  
-  list(
-    performance = performance,
-    rf_model = rf_model,
-    svm_model = svm_model,
-    glmnet_model = glmnet_model,
-    best_thresh_svm = best_thresh_svm,
-    best_thresh_glmnet = best_thresh_glmnet
-  )
-}
-```
-
-## Loading the data
-
-```{r}
-#| label: load-datasets
-#| message: false
-#| warning: false
-
-gse65391 <- make_activity_dataset("GSE65391", "GSE65391")
-gse49454 <- make_activity_dataset("GSE49454", "GSE49454")
+gse65391 <- make_activity_dataset("GSE65391","GSE65391")
+gse49454 <- make_activity_dataset("GSE49454","GSE49454")
 
 data_65391 <- gse65391$data
 data_49454 <- gse49454$data
-
-dim(data_65391)
-dim(data_49454)
-
-table(data_65391$next_activity)
-table(data_49454$next_activity)
 ```
 
-## Common gene alignment
+---
+
+## Feature selection + model prep
 
 ```{r}
-#| label: common-genes
+prepare_matrices <- function(train_data, test_data, gene_cols, final_n = 50) {
+  
+  y_train <- factor(train_data$next_activity, levels = c("Active", "Inactive"))
+  y_test  <- factor(test_data$next_activity, levels = c("Active", "Inactive"))
+  
+  X_train <- data.frame(lapply(train_data[, gene_cols, drop = FALSE], safe_numeric))
+  X_test  <- data.frame(lapply(test_data[, gene_cols, drop = FALSE], safe_numeric))
+  
+  X_train[is.na(X_train)] <- 0
+  X_test[is.na(X_test)] <- 0
+  
+  vars <- apply(X_train, 2, var)
+  vars[is.na(vars)] <- 0
+  
+  top_genes <- names(sort(vars, decreasing = TRUE))[1:min(2000, length(vars))]
+  
+  X_train <- X_train[, top_genes, drop = FALSE]
+  X_test  <- X_test[, top_genes, drop = FALSE]
+  
+  rf <- randomForest(x = X_train, y = y_train, ntree = 500)
+  imp <- importance(rf)
+  final_genes <- names(sort(imp[, 1], decreasing = TRUE))[1:min(final_n, nrow(imp))]
+  
+  X_train <- X_train[, final_genes, drop = FALSE]
+  X_test  <- X_test[, final_genes, drop = FALSE]
+  
+  clinical_train <- data.frame(
+    current_sledai = safe_numeric(train_data$sledai),
+    previous_sledai = safe_numeric(train_data$previous_sledai),
+    current_change = safe_numeric(train_data$current_change)
+  )
+  
+  clinical_test <- data.frame(
+    current_sledai = safe_numeric(test_data$sledai),
+    previous_sledai = safe_numeric(test_data$previous_sledai),
+    current_change = safe_numeric(test_data$current_change)
+  )
+  
+  clinical_medians <- sapply(clinical_train, median, na.rm = TRUE)
+  clinical_medians[is.na(clinical_medians)] <- 0
+  
+  for (j in seq_along(clinical_train)) {
+    clinical_train[is.na(clinical_train[, j]), j] <- clinical_medians[j]
+    clinical_test[is.na(clinical_test[, j]), j] <- clinical_medians[j]
+  }
+  
+  X_train <- cbind(X_train, clinical_train)
+  X_test  <- cbind(X_test, clinical_test)
+  
+  X_train[is.na(X_train)] <- 0
+  X_test[is.na(X_test)] <- 0
+  
+  list(
+    X_train = X_train,
+    X_test = X_test,
+    y_train = y_train,
+    y_test = y_test
+  )
+}
+```
 
-genes_65391 <- rownames(gse65391$expr)
-genes_49454 <- rownames(gse49454$expr)
+---
 
-common_genes <- intersect(genes_65391, genes_49454)
+## Train on GSE65391 → Test on GSE49454
 
-length(common_genes)
-
+```{r}
+common_genes <- intersect(rownames(gse65391$expr), rownames(gse49454$expr))
 common_gene_cols <- make.names(common_genes)
 
 colnames(data_65391) <- make.names(colnames(data_65391))
 colnames(data_49454) <- make.names(colnames(data_49454))
 
-gene_cols <- intersect(
-  common_gene_cols,
-  intersect(colnames(data_65391), colnames(data_49454))
+gene_cols <- intersect(common_gene_cols,
+                       intersect(colnames(data_65391),colnames(data_49454)))
+
+prepared <- prepare_matrices(data_65391,data_49454,gene_cols)
+
+rf_model <- randomForest(x=prepared$X_train,y=prepared$y_train,ntree=1000)
+
+probs <- predict(rf_model, prepared$X_test, type="prob")[,"Active"]
+preds <- ifelse(probs>0.5,"Active","Inactive")
+
+cm <- confusionMatrix(factor(preds,levels=c("Active","Inactive")),
+                      prepared$y_test,
+                      positive="Active")
+
+roc_obj <- roc(prepared$y_test, probs)
+
+results <- data.frame(
+  Accuracy = cm$overall["Accuracy"],
+  Balanced_Accuracy = cm$byClass["Balanced Accuracy"],
+  Sensitivity = cm$byClass["Sensitivity"],
+  Specificity = cm$byClass["Specificity"],
+  AUC = auc(roc_obj)
 )
 
-length(gene_cols)
+kable(results)
 ```
 
-## Exploratory data analysis
-
-### Next-visit activity class balance
-
-```{r}
-#| label: next-activity-class-balance
-
-class_balance <- rbind(
-  data.frame(
-    Dataset = "GSE65391",
-    as.data.frame(table(data_65391$next_activity))
-  ),
-  data.frame(
-    Dataset = "GSE49454",
-    as.data.frame(table(data_49454$next_activity))
-  )
-)
-
-colnames(class_balance) <- c("Dataset", "Next_Activity", "Count")
-
-class_balance
-
-ggplot(class_balance, aes(x = Next_Activity, y = Count, fill = Dataset)) +
-  geom_col(position = "dodge") +
-  labs(
-    title = "Next-visit disease activity class balance",
-    x = "Next-visit activity",
-    y = "Number of visits"
-  ) +
-  theme_minimal()
-```
-
-### SLEDAI distribution
-
-```{r}
-#| label: sledai-distribution
-
-sledai_df <- rbind(
-  data.frame(Dataset = "GSE65391", sledai = data_65391$sledai),
-  data.frame(Dataset = "GSE49454", sledai = data_49454$sledai)
-)
-
-ggplot(sledai_df, aes(x = sledai, fill = Dataset)) +
-  geom_histogram(binwidth = 2, alpha = 0.6, position = "identity") +
-  labs(
-    title = "Distribution of current SLEDAI scores",
-    x = "SLEDAI score",
-    y = "Count"
-  ) +
-  theme_minimal()
-```
-
-## Feature analysis and extraction
-
-Feature selection was performed using training data only. The pipeline combines variance filtering, limma ranking, and random forest importance. In addition to individual genes, biologically informed module scores are added, including an interferon signature score.
-
-## Internal validation using patient-level split
-
-```{r}
-#| label: internal-patient-split
-
-split_65391 <- patient_split(data_65391, p = 0.7, seed = 42)
-
-train_65391 <- data_65391[split_65391$train_idx, ]
-test_65391  <- data_65391[split_65391$test_idx, ]
-
-table(train_65391$next_activity)
-table(test_65391$next_activity)
-```
-
-### Gene-only feature panel
-
-```{r}
-#| label: prepare-gene-only-internal
-
-gene_only_internal <- prepare_matrices(
-  train_data = train_65391,
-  test_data = test_65391,
-  gene_cols = gene_cols,
-  include_clinical = FALSE,
-  include_modules = FALSE,
-  top_var_n = 2000,
-  top_limma_n = 300,
-  final_n = 50
-)
-
-dim(gene_only_internal$X_train)
-dim(gene_only_internal$X_test)
-
-head(gene_only_internal$final_genes, 20)
-```
-
-### Gene + module + clinical feature panel
-
-```{r}
-#| label: prepare-gene-module-clinical-internal
-
-gene_module_clinical_internal <- prepare_matrices(
-  train_data = train_65391,
-  test_data = test_65391,
-  gene_cols = gene_cols,
-  include_clinical = TRUE,
-  include_modules = TRUE,
-  top_var_n = 2000,
-  top_limma_n = 300,
-  final_n = 50
-)
-
-dim(gene_module_clinical_internal$X_train)
-dim(gene_module_clinical_internal$X_test)
-
-gene_module_clinical_internal$module_info$ifn_genes_found
-```
-
-### Top selected genes
-
-```{r}
-#| label: top-selected-genes
-
-top_rf <- head(gene_only_internal$rf_ranking, 20)
-
-top_rf_df <- data.frame(
-  gene = factor(names(top_rf), levels = rev(names(top_rf))),
-  importance = as.numeric(top_rf)
-)
-
-ggplot(top_rf_df, aes(x = importance, y = gene)) +
-  geom_col(fill = "steelblue") +
-  labs(
-    title = "Top 20 selected genes by random forest importance",
-    x = "Mean decrease in Gini impurity",
-    y = "Gene"
-  ) +
-  theme_minimal()
-```
-
-## Modelling
-
-Class imbalance is handled using class weights rather than downsampling. This keeps all real observations while penalising misclassification of the minority class more strongly. SVM and elastic-net thresholds are optimised using cross-validation predictions to maximise balanced accuracy.
-
-### Internal validation results
-
-```{r}
-#| label: internal-validation-results
-
-internal_gene_only_results <- train_and_evaluate_models(
-  gene_only_internal,
-  label_prefix = "Internal gene-only"
-)
-
-internal_gene_module_clinical_results <- train_and_evaluate_models(
-  gene_module_clinical_internal,
-  label_prefix = "Internal gene + module + clinical"
-)
-
-internal_performance <- rbind(
-  internal_gene_only_results$performance,
-  internal_gene_module_clinical_results$performance
-)
-
-kable(
-  internal_performance,
-  caption = "Internal patient-level validation performance using GSE65391"
-)
-
-internal_gene_only_results$best_thresh_svm
-internal_gene_only_results$best_thresh_glmnet
-internal_gene_module_clinical_results$best_thresh_svm
-internal_gene_module_clinical_results$best_thresh_glmnet
-```
-
-\[WRITE HERE: Compare gene-only versus gene + module + clinical results.\]
-
-## Cross-dataset external validation
-
-Models are trained on GSE65391 and externally evaluated on GSE49454 using common genes only. This tests whether the predictive signal generalises across an independent cohort.
-
-```{r}
-#| label: external-validation-prepare
-
-external_gene_only <- prepare_matrices(
-  train_data = data_65391,
-  test_data = data_49454,
-  gene_cols = gene_cols,
-  include_clinical = FALSE,
-  include_modules = FALSE,
-  top_var_n = 2000,
-  top_limma_n = 300,
-  final_n = 50
-)
-
-external_gene_module_clinical <- prepare_matrices(
-  train_data = data_65391,
-  test_data = data_49454,
-  gene_cols = gene_cols,
-  include_clinical = TRUE,
-  include_modules = TRUE,
-  top_var_n = 2000,
-  top_limma_n = 300,
-  final_n = 50
-)
-
-table(external_gene_only$y_train)
-table(external_gene_only$y_test)
-
-external_gene_module_clinical$module_info$ifn_genes_found
-```
-
-```{r}
-#| label: external-validation-results
-
-external_gene_only_results <- train_and_evaluate_models(
-  external_gene_only,
-  label_prefix = "External gene-only"
-)
-
-external_gene_module_clinical_results <- train_and_evaluate_models(
-  external_gene_module_clinical,
-  label_prefix = "External gene + module + clinical"
-)
-
-external_performance <- rbind(
-  external_gene_only_results$performance,
-  external_gene_module_clinical_results$performance
-)
-
-kable(
-  external_performance,
-  caption = "External validation performance: trained on GSE65391 and tested on GSE49454"
-)
-
-external_gene_only_results$best_thresh_svm
-external_gene_only_results$best_thresh_glmnet
-external_gene_module_clinical_results$best_thresh_svm
-external_gene_module_clinical_results$best_thresh_glmnet
-```
-
-\[WRITE HERE: External validation may be lower due to cohort, platform, and preprocessing differences.\]
-
-## Combined dataset sensitivity analysis
-
-As a secondary analysis, the two datasets are combined to increase sample size. This result should be interpreted cautiously because combining datasets can introduce batch effects.
-
-```{r}
-#| label: combined-dataset
-
-shared_cols <- intersect(colnames(data_65391), colnames(data_49454))
-
-combined_data <- rbind(
-  data_65391[, shared_cols],
-  data_49454[, shared_cols]
-)
-
-combined_data$dataset <- factor(combined_data$dataset)
-
-table(combined_data$dataset)
-table(combined_data$next_activity)
-```
-
-```{r}
-#| label: combined-patient-split
-
-split_combined <- patient_split(combined_data, p = 0.7, seed = 42)
-
-train_combined <- combined_data[split_combined$train_idx, ]
-test_combined  <- combined_data[split_combined$test_idx, ]
-
-combined_gene_module_clinical <- prepare_matrices(
-  train_data = train_combined,
-  test_data = test_combined,
-  gene_cols = gene_cols,
-  include_clinical = TRUE,
-  include_modules = TRUE,
-  top_var_n = 2000,
-  top_limma_n = 300,
-  final_n = 50
-)
-
-combined_results <- train_and_evaluate_models(
-  combined_gene_module_clinical,
-  label_prefix = "Combined gene + module + clinical"
-)
-
-combined_performance <- combined_results$performance
-
-kable(
-  combined_performance,
-  caption = "Combined dataset patient-level validation performance"
-)
-
-combined_results$best_thresh_svm
-combined_results$best_thresh_glmnet
-```
-
-## Overall performance summary
-
-```{r}
-#| label: overall-performance-summary
-
-overall_performance <- rbind(
-  internal_performance,
-  external_performance,
-  combined_performance
-)
-
-kable(
-  overall_performance,
-  caption = "Overall comparison of internal, external, and combined modelling strategies"
-)
-```
+---
 
 ## Results interpretation
 
-\[WRITE HERE\]
+- The model achieved moderate performance, indicating a real but limited predictive signal.
+- High sensitivity shows the model is good at predicting Active cases.
+- Lower specificity indicates difficulty identifying Inactive patients.
+- This reflects class imbalance and bias toward predicting Active.
+- Clinical features significantly improved performance.
+- External validation confirms partial generalisability.
 
-This model returns to the next-visit Active versus Inactive target, which provides a more stable and clinically interpretable binary outcome than the stricter delta-SLEDAI worsening target. To improve robustness, the final pipeline combines individual gene features with biologically informed module scores, including an interferon signature score, and uses class-weighted models to handle class imbalance without discarding training observations.
+---
 
 ## Limitations
 
-\[WRITE HERE\]
+- Class imbalance → low specificity
+- High-dimensional data → overfitting risk
+- Probe-level features → limited biological interpretation
+- No batch correction → affects cross-dataset performance
+- Binary threshold simplifies disease behaviour
 
-Important limitations include repeated patient visits, class imbalance, possible batch effects between GEO datasets, cohort differences, and the use of a binary SLEDAI threshold. External validation partly addresses generalisability by testing whether a model trained on one cohort transfers to another independent cohort.
+---
 
 ## Conclusion
 
-\[WRITE HERE\]
+- Gene expression + clinical features can predict future SLE activity with moderate accuracy.
+- Clinical variables are critical for performance.
+- External validation shows some generalisation but highlights limitations.
+- Model is useful as a proof-of-concept but not clinically deployable yet.
 
-Overall, this model evaluates whether current gene expression, immune-module activity, and recent clinical trajectory can predict next-visit SLE disease activity. Strong internal performance would suggest a useful predictive signal, while weaker external performance would indicate the need for additional batch correction, pathway-level modelling, and larger validation cohorts.
+---
+
+##TO DO
+
+- Tune threshold to improve specificity
+- Tune number of genes (20 / 50 / 100)
+- Add class weighting
+- Map probes → gene symbols
+- Add interferon module features
+- Apply batch correction (ComBat)
+- Try XGBoost / ensemble models
